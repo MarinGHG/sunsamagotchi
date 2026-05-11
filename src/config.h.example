@@ -1,0 +1,26 @@
+#pragma once
+
+// ─── WiFi ───────────────────────────────────────────────────────────────────
+#define WIFI_SSID       "YOUR_WIFI_SSID"
+#define WIFI_PASS       "YOUR_WIFI_PASSWORD"
+
+// ─── Sunsama MCP ────────────────────────────────────────────────────────────
+// Get your token from the Sunsama web app: Settings → Integrations → API Token
+#define MCP_HOST        "api.sunsama.com"
+#define MCP_ENDPOINT    "/mcp"
+#define MCP_PORT        443
+#define AUTH_TOKEN       "YOUR_SUNSAMA_API_TOKEN"
+
+// ─── Timezone & NTP ─────────────────────────────────────────────────────────
+#define TZ_OFFSET_SEC   7200     // UTC+2 (CEST)
+#define NTP_SERVER      "pool.ntp.org"
+
+// ─── Max items ──────────────────────────────────────────────────────────────
+#define MAX_TASKS       12
+#define MAX_EVENTS      8
+
+// ─── Defaults (overridden by NVS settings at runtime) ───────────────────────
+#define DEFAULT_SLEEP_MIN      5
+#define DEFAULT_REFRESH_MIN    3
+#define DEFAULT_ACTIVE_TO_MS   60000
+#define DEFAULT_USE_24H        true

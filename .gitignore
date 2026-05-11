@@ -1,0 +1,19 @@
+# Build artifacts
+.pio/
+
+# Credentials — copy config.h.example to config.h and fill in your own
+src/config.h
+!src/config.h.example
+
+# Local environment
+.env
+.claude/
+
+# Third-party reference material not part of this project
+additional-docs/bruce-firmware/
+
+# Sunsama logo (third-party trademark)
+sunsamalogo.png
+
+# macOS
+.DS_Store
