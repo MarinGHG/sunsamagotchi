@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2024 Marin Benke
+// Copyright (c) 2026 Marin Benke
 #pragma once
 
 #include <M5Unified.h>
@@ -183,12 +183,14 @@ inline void setQualityMode() {
 }
 
 // ── Sleep ───────────────────────────────────────────────────────────────────
-// Default sleep cycle: 5 minutes.  Caller can override via sleepMin parameter.
-static const uint8_t SLEEP_CYCLE_MIN = 5;
+// While in deep sleep we wake every minute to update the displayed clock with
+// a partial refresh.  Data is only refetched from Sunsama on every Nth wake
+// (controlled by AppSettings.refreshMinutes in main.cpp).
+static const uint32_t WAKE_INTERVAL_SEC = 60;
 
-inline void setupWakeSources(uint8_t sleepMin = SLEEP_CYCLE_MIN) {
-    if (sleepMin < 1) sleepMin = 1;
-    esp_sleep_enable_timer_wakeup((uint64_t)sleepMin * 60ULL * 1000000ULL);
+inline void setupWakeSources(uint32_t wakeSec = WAKE_INTERVAL_SEC) {
+    if (wakeSec < 5) wakeSec = 5;
+    esp_sleep_enable_timer_wakeup((uint64_t)wakeSec * 1000000ULL);
 #ifdef BOARD_COREINK
     // Dial press = GPIO38. Use ext0 (single-pin, active-low).
     // Ensure pull-up is enabled during deep sleep.
@@ -207,9 +209,34 @@ inline void setupWakeSources(uint8_t sleepMin = SLEEP_CYCLE_MIN) {
 inline void enterSleep() {
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
+#if IS_EINK
+    // Wait for the in-flight refresh to complete, then issue POF (Power Off)
+    // via setPowerSave(true).  We deliberately skip the full DSLP command:
+    //   - DSLP forces a panel re-init (and thus a full-clearing flash) on the
+    //     next wake, which the user sees as a black flicker every minute.
+    //   - POF alone leaves the panel controller off but the bistable e-ink
+    //     pixels stay latched (they hold for hours/days without driving),
+    //     and on wake we can do a proper partial refresh — no flash.
+    M5.Display.waitDisplay();
+    M5.Display.powerSave(true);
+#else
+    M5.Display.sleep();
+#endif
+#ifdef BOARD_COREINK
+    // CoreInk power latch: GPIO12 (POWER_HOLD) must stay HIGH on battery,
+    // otherwise the latch releases the battery and the device fully powers
+    // off during deep sleep (only G27 — which mechanically re-arms the
+    // latch — will then bring it back, with a cold boot).
+    // gpio_hold_en freezes the current output level (HIGH from M5.begin)
+    // through deep sleep; gpio_deep_sleep_hold_en arms the hold globally.
+    pinMode(12, OUTPUT);
+    digitalWrite(12, HIGH);
+    gpio_hold_en(GPIO_NUM_12);
+    gpio_deep_sleep_hold_en();
+#endif
     Serial.println("[Sleep] Sleeping now...");
     Serial.flush();
-    delay(100);
+    delay(50);
     esp_deep_sleep_start();
 }
 
@@ -220,8 +247,18 @@ inline void initDevice() {
     cfg.internal_mic = false;
     cfg.internal_spk = false;
     cfg.serial_baudrate = 115200;
+#ifdef BOARD_COREINK
+    // Re-assert power latch IMMEDIATELY on wake, before anything else can
+    // glitch GPIO12 low and drop battery power.  Then release the deep-sleep
+    // hold so the pin is writable again.
+    pinMode(12, OUTPUT);
+    digitalWrite(12, HIGH);
+    gpio_hold_dis(GPIO_NUM_12);
+    gpio_deep_sleep_hold_dis();
+#endif
     M5.begin(cfg);
 #ifdef BOARD_COREINK
+    digitalWrite(12, HIGH);       // belt-and-suspenders after M5.begin
     M5.Display.setRotation(0);    // Portrait 200x200
 #else
     M5.Display.setRotation(3);    // Landscape 240x135

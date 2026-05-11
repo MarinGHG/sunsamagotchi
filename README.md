@@ -63,7 +63,7 @@ Edit `src/config.h`:
 #define AUTH_TOKEN  "your-sunsama-api-token"
 ```
 
-Get your Sunsama API token from: **Settings → Integrations → API Token**
+Get your Sunsama Bearer token from: **Settings → Integrations → MCP → Bearer token (legacy)**
 
 Adjust `TZ_OFFSET_SEC` for your timezone (e.g. `3600` for UTC+1, `0` for UTC).
 

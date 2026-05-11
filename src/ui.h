@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2024 Marin Benke
+// Copyright (c) 2026 Marin Benke
 #pragma once
 
 #include <M5Unified.h>

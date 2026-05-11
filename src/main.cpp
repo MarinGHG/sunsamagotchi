@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2024 Marin Benke
+// Copyright (c) 2026 Marin Benke
 // Sunsamagotchi — a Sunsama companion for M5Stack devices
 #include <M5Unified.h>
 #include <WiFi.h>
@@ -33,6 +33,18 @@ RTC_DATA_ATTR uint8_t   rtcEventScrollOff = 0;
 RTC_DATA_ATTR uint8_t   rtcTimerScrollOff = 0;
 RTC_DATA_ATTR time_t    rtcTimerFetchedAt = 0;       // system time when timer was last fetched
 RTC_DATA_ATTR uint32_t  rtcTimerElapsedAtFetch = 0;  // elapsedSec at that moment
+// Counts timer-driven wakes since the last full-clearing refresh.  Partial
+// (DU / "fastest") refreshes accumulate ghosting; we periodically run one
+// full epd_quality refresh to clear it.
+RTC_DATA_ATTR uint16_t  rtcWakeCounter = 0;
+// How many consecutive partial refreshes before we force one full clear.
+// 30 wakes ≈ 30 minutes when waking once per minute.
+#define FULL_REFRESH_EVERY 30
+// When a timer is active we already track elapsed locally and don't need the
+// API for the second-by-second value — we only need to occasionally check if
+// the timer was stopped on another device.  This is the floor (in minutes)
+// for the API sync interval while a timer is running.
+#define TIMER_ACTIVE_MIN_REFRESH_MIN 10
 
 // ─── RAM state ──────────────────────────────────────────────────────────────
 static M5Canvas canvas(&M5.Display);
@@ -87,6 +99,18 @@ static uint32_t   wakeTime        = 0;
 void pushDisplay() {
     HAL::pushCanvas(canvas);
 }
+
+// ─── Async fetch state (runs on Core 0 so UI never freezes) ─────────────────
+static TaskItem    stageTasks[MAX_TASKS];
+static uint8_t     stageTaskCount = 0;
+static EventItem   stageEvents[MAX_EVENTS];
+static uint8_t     stageEventCount = 0;
+static TimerInfo   stageTimer;
+static PlanSummary stagePlan;
+static volatile bool      asyncFetchRunning = false;
+static volatile bool      asyncFetchDone    = false;
+static volatile bool      asyncFetchOk      = false;
+static TaskHandle_t       asyncFetchHandle  = nullptr;
 
 // ─── WiFi ───────────────────────────────────────────────────────────────────
 bool connectWiFi() {
@@ -193,6 +217,19 @@ void updateTimeFromHardwareRTC() {
     }
 }
 
+// ─── Refresh-interval helper ────────────────────────────────────────────────
+// While a timer is running, we slow down API sync to save power and battery —
+// the elapsed time is computed locally from rtcTimerFetchedAt anyway, and we
+// only need to occasionally check whether the timer was stopped on another
+// device.  Floored at TIMER_ACTIVE_MIN_REFRESH_MIN minutes.
+static uint8_t effectiveRefreshMinutes() {
+    uint8_t base = appSettings.refreshMinutes;
+    if (timerInfo.active && base < TIMER_ACTIVE_MIN_REFRESH_MIN) {
+        return TIMER_ACTIVE_MIN_REFRESH_MIN;
+    }
+    return base;
+}
+
 // ─── Timer sync ─────────────────────────────────────────────────────────────
 // Computes elapsed seconds anchored to the last cloud fetch, so the timer
 // stays in sync with Sunsama's cloud timer through deep-sleep cycles.
@@ -256,35 +293,85 @@ bool restoreStateFromRTC() {
     return true;
 }
 
-// ─── Data Fetch — silent, no UI overlay ─────────────────────────────────────
-void fetchAllData() {
-    Serial.println("[Data] Fetching all data...");
-    fetchInProgress = true;
-
-    updateTimeStrings();
-
+// ─── Data Fetch — runs on Core 0 so UI thread never blocks ──────────────────
+// Writes into staging buffers; main loop swaps them into live state when done.
+static void asyncFetchTaskFn(void* /*arg*/) {
+    Serial.println("[Data] Async fetch starting on core 0");
     bool ok = true;
-    ok &= mcp.fetchTasks(todayStr, tasks, taskCount, MAX_TASKS);
-    ok &= mcp.fetchEvents(todayStr, events, eventCount, MAX_EVENTS);
-    ok &= mcp.fetchTimer(timerInfo);
-    ok &= mcp.fetchPlanSummary(todayStr, planSummary);
+    stageTaskCount  = 0;
+    stageEventCount = 0;
+    memset(&stageTimer, 0, sizeof(stageTimer));
+    memset(&stagePlan,  0, sizeof(stagePlan));
 
-    // Anchor timer to now so elapsed tracks wall-clock through sleep cycles
-    if (timerInfo.active) {
-        time(&rtcTimerFetchedAt);
-        rtcTimerElapsedAtFetch = timerInfo.elapsedSec;
-    } else {
-        rtcTimerFetchedAt = 0;
-        rtcTimerElapsedAtFetch = 0;
+    ok &= mcp.fetchTasks(todayStr, stageTasks, stageTaskCount, MAX_TASKS);
+    ok &= mcp.fetchEvents(todayStr, stageEvents, stageEventCount, MAX_EVENTS);
+    ok &= mcp.fetchTimer(stageTimer);
+    ok &= mcp.fetchPlanSummary(todayStr, stagePlan);
+
+    asyncFetchOk      = ok;
+    asyncFetchDone    = true;
+    asyncFetchRunning = false;
+    asyncFetchHandle  = nullptr;
+    Serial.printf("[Data] Async fetch finished ok=%d tasks=%d events=%d\n",
+                  (int)ok, stageTaskCount, stageEventCount);
+    vTaskDelete(nullptr);
+}
+
+// Start a non-blocking fetch on Core 0.  Returns false if one is already running.
+bool startAsyncFetch() {
+    if (asyncFetchRunning) return false;
+    if (!mcpReady)         return false;
+    updateTimeStrings();
+    asyncFetchRunning = true;
+    asyncFetchDone    = false;
+    fetchInProgress   = true;
+    BaseType_t r = xTaskCreatePinnedToCore(
+        asyncFetchTaskFn, "mcpFetch", 16384, nullptr,
+        1, &asyncFetchHandle, 0);   // pin to core 0 (Arduino runs on core 1)
+    if (r != pdPASS) {
+        Serial.println("[Data] Failed to create fetch task");
+        asyncFetchRunning = false;
+        fetchInProgress   = false;
+        return false;
     }
+    return true;
+}
 
-    dataLoaded = ok;
-    if (!ok) Serial.println("[Data] Some fetches failed");
+// Swap staged data into live state.  Called from main loop on Core 1.
+void commitAsyncFetch() {
+    if (!asyncFetchDone) return;
+    asyncFetchDone = false;
 
-    saveStateToRTC();
-    needsRedraw = true;
-    lastRefresh = millis();
+    if (asyncFetchOk) {
+        memcpy(tasks,  stageTasks,  sizeof(tasks));
+        taskCount = stageTaskCount;
+        memcpy(events, stageEvents, sizeof(events));
+        eventCount = stageEventCount;
+        timerInfo  = stageTimer;
+        planSummary = stagePlan;
+
+        if (timerInfo.active) {
+            time(&rtcTimerFetchedAt);
+            rtcTimerElapsedAtFetch = timerInfo.elapsedSec;
+        } else {
+            rtcTimerFetchedAt = 0;
+            rtcTimerElapsedAtFetch = 0;
+        }
+        dataLoaded = true;
+        time(&rtcLastDataFetch);
+        saveStateToRTC();
+        Serial.println("[Data] Live state updated");
+    } else {
+        Serial.println("[Data] Fetch failed, keeping previous data");
+    }
     fetchInProgress = false;
+    lastRefresh     = millis();
+    needsRedraw     = true;
+}
+
+// Convenience wrapper retained for compatibility — kicks off async fetch.
+void fetchAllData() {
+    startAsyncFetch();
 }
 
 // ─── Display ────────────────────────────────────────────────────────────────
@@ -466,8 +553,10 @@ void handleButtons() {
     }
 #endif
 
-    // Don't process buttons during fetch
-    if (fetchInProgress) return;
+    // During an in-progress fetch, allow only navigation (page / up / down) and
+    // suppress destructive actions (timer start/stop, task complete, settings).
+    // We do this further below at each action site rather than early-returning,
+    // so the UI stays fully responsive while data loads on core 0.
 
 #ifdef BOARD_M5STICK_CPLUS2
     // BtnEXT (upper-left, GPIO35) doubles as hardware power button.
@@ -567,9 +656,10 @@ void handleButtons() {
     }
 
     // ── Force refresh (silent) — cooldown prevents false triggers from rapid paging ──
-    if (HAL::forceRefreshHeld() && !activity && (millis() - lastPagePressMs > 1000)) {
+    if (HAL::forceRefreshHeld() && !activity && !fetchInProgress
+        && (millis() - lastPagePressMs > 1000)) {
         Serial.println("[Action] Force refresh");
-        if (mcpReady) fetchAllData();
+        if (mcpReady) startAsyncFetch();
         activity = true;
     }
 
@@ -634,7 +724,9 @@ void handleButtons() {
     }
 
     // ── CONFIRM: Context-specific action ──
-    if (HAL::confirmPressed()) {
+    // Suppress destructive actions while a fetch is in progress (mcp client is
+    // not re-entrant); navigation still works.
+    if (HAL::confirmPressed() && !fetchInProgress) {
         activity = true;
 
         switch (currentScreen) {
@@ -689,81 +781,148 @@ void handleButtons() {
 }
 
 // ─── Deep Sleep ─────────────────────────────────────────────────────────────
+//
+// Design notes for the standby screen:
+//   • Desk-readable.  Clock and (if running) timer are the focal points and
+//     are sized large enough to read across a desk.
+//   • E-ink partial refresh.  Most wakes use epd_fastest (DU waveform) so the
+//     panel updates without a black flash.  Every FULL_REFRESH_EVERY wakes we
+//     do one full epd_quality refresh to clear any accumulated ghosting.
+//   • Two layouts, depending on whether a timer is active.  When a timer is
+//     running it owns the centre of the screen; the clock and date shrink to
+//     a small status bar at the top.
+//   • The footer carries actionable status, not decorative text: how recent
+//     the data is, battery, and a hint that the dial wakes the device.
+
 void enterDeepSleep() {
     Serial.println("[Sleep] Entering deep sleep...");
-    // Sync timer elapsed before saving so sleep screen shows correct value
     if (timerInfo.active) timerInfo.elapsedSec = timerCurrentElapsed();
     saveStateToRTC();
 
-    HAL::setQualityMode();
+#if IS_EINK
+    // Pick refresh mode: every Nth wake force a clean full refresh, otherwise
+    // use the fastest partial waveform (no flash, mild ghosting).
+    rtcWakeCounter++;
+    bool fullRefresh = (rtcWakeCounter % FULL_REFRESH_EVERY) == 0;
+    M5.Display.setEpdMode(fullRefresh ? epd_mode_t::epd_quality
+                                       : epd_mode_t::epd_fastest);
+#endif
     canvas.fillSprite(CLR_BG);
     updateTimeStrings();
 
-#if IS_EINK
-    // ── CoreInk 200x200: always-on sleep display ──────────────────────────────
-    // All text in full CLR_TEXT (no dimming) so e-ink renders crisp black.
-    canvas.setTextColor(CLR_TEXT);
+    int batt = M5.Power.getBatteryLevel();
+    if (batt < 0) batt = 0; if (batt > 100) batt = 100;
 
-    // Large clock
-    canvas.setFont(&fonts::FreeSansBold18pt7b);
-    int tw = canvas.textWidth(currentTime);
-    canvas.drawString(currentTime, (SCREEN_W - tw) / 2, 22);
-
-    // Date
-    canvas.setFont(&fonts::FreeSansBold9pt7b);
-    int dw = canvas.textWidth(currentDate);
-    canvas.drawString(currentDate, (SCREEN_W - dw) / 2, 56);
-    UI::drawDottedLine(canvas, 74);
-
-    // Next task
-    canvas.setFont(&fonts::Font2);
-    canvas.setTextColor(CLR_TEXT);
-    bool foundNext = false;
-    for (int i = 0; i < taskCount; i++) {
-        if (!tasks[i].completed) {
-            canvas.drawString("Next:", 6, 80);
-            char tt[30]; UI::truncPx(canvas, tt, tasks[i].title, SCREEN_W - 16);
-            canvas.drawString(tt, 6, 96);
-            if (tasks[i].projStart[0]) {
-                char t24s[12], t24e[12];
-                UI::formatApiTime(t24s, sizeof(t24s), tasks[i].projStart, appSettings.use24h);
-                UI::formatApiTime(t24e, sizeof(t24e), tasks[i].projEnd, appSettings.use24h);
-                char sched[28];
-                snprintf(sched, sizeof(sched), "%s - %s", t24s, t24e);
-                canvas.drawString(sched, 6, 112);
-            }
-            if (tasks[i].timeEst[0]) {
-                canvas.setFont(&fonts::Font0);
-                canvas.drawString(tasks[i].timeEst, 6, 126);
-                canvas.setFont(&fonts::Font2);
-            }
-            foundNext = true;
-            break;
+    // Format minutes-since-last-fetch for the status footer
+    char ageStr[16] = "—";
+    if (rtcLastDataFetch > 0) {
+        time_t nowTs; time(&nowTs);
+        if (nowTs > rtcLastDataFetch) {
+            uint32_t mins = (uint32_t)((nowTs - rtcLastDataFetch) / 60);
+            if (mins < 1) snprintf(ageStr, sizeof(ageStr), "now");
+            else if (mins < 60) snprintf(ageStr, sizeof(ageStr), "%lum ago", (unsigned long)mins);
+            else snprintf(ageStr, sizeof(ageStr), "%luh ago", (unsigned long)(mins / 60));
         }
     }
-    if (!foundNext) {
-        canvas.setFont(&fonts::FreeSansBold9pt7b);
-        int aw = canvas.textWidth("All tasks done!");
-        canvas.drawString("All tasks done!", (SCREEN_W - aw) / 2, 96);
-    }
 
-    // Active timer
+    // Count incomplete tasks
+    uint8_t doneCnt = 0;
+    for (uint8_t i = 0; i < taskCount; i++) if (tasks[i].completed) doneCnt++;
+
+#if IS_EINK
+    // ── CoreInk 200x200 standby screen ────────────────────────────────────────
+    canvas.setTextColor(CLR_TEXT);
+
     if (timerInfo.active) {
-        UI::drawDottedLine(canvas, 142);
+        // ── TIMER-ACTIVE LAYOUT ───────────────────────────────────────────────
+        // Top status bar: small clock left, date right
+        canvas.setFont(&fonts::FreeSansBold9pt7b);
+        canvas.drawString(currentTime, 6, 6);
+        int dw = canvas.textWidth(currentDate);
+        canvas.drawString(currentDate, SCREEN_W - dw - 6, 6);
+        UI::drawDottedLine(canvas, 28);
+
+        // Label
         canvas.setFont(&fonts::Font2);
-        UI::drawIcon8(canvas, 6, 150, UI::ICON_TIMER);
-        char ts[40]; UI::truncPx(canvas, ts, timerInfo.taskTitle, SCREEN_W - 24);
-        canvas.drawString(ts, 18, 150);
+        const char* lbl = "TIMER RUNNING";
+        int lw = canvas.textWidth(lbl);
+        canvas.drawString(lbl, (SCREEN_W - lw) / 2, 38);
+
+        // HUGE elapsed time
+        char el[16];
+        UI::formatElapsedMin(el, sizeof(el), timerInfo.elapsedSec);
+        canvas.setFont(&fonts::FreeSansBold24pt7b);
+        int ew = canvas.textWidth(el);
+        canvas.drawString(el, (SCREEN_W - ew) / 2, 60);
+
+        // Working on …
+        canvas.setFont(&fonts::Font0);
+        canvas.drawString("Working on:", 6, 118);
+        canvas.setFont(&fonts::FreeSansBold9pt7b);
+        char tt[40]; UI::truncPx(canvas, tt, timerInfo.taskTitle, SCREEN_W - 12);
+        canvas.drawString(tt, 6, 130);
+    } else {
+        // ── IDLE LAYOUT (clock dominates) ─────────────────────────────────────
+        // HUGE clock, centred high
+        canvas.setFont(&fonts::FreeSansBold24pt7b);
+        int tw = canvas.textWidth(currentTime);
+        canvas.drawString(currentTime, (SCREEN_W - tw) / 2, 18);
+
+        // Date
+        canvas.setFont(&fonts::FreeSansBold9pt7b);
+        int dw = canvas.textWidth(currentDate);
+        canvas.drawString(currentDate, (SCREEN_W - dw) / 2, 78);
+
+        UI::drawDottedLine(canvas, 102);
+
+        // Tasks summary
+        char summary[24];
+        snprintf(summary, sizeof(summary), "Tasks  %d / %d done",
+                 (int)doneCnt, (int)taskCount);
+        canvas.setFont(&fonts::Font2);
+        int sw = canvas.textWidth(summary);
+        canvas.drawString(summary, (SCREEN_W - sw) / 2, 110);
+
+        // Progress bar
+        int pbX = 14, pbY = 128, pbW = SCREEN_W - 28, pbH = 8;
+        canvas.drawRect(pbX, pbY, pbW, pbH, CLR_TEXT);
+        if (taskCount > 0) {
+            int fill = (pbW - 2) * doneCnt / taskCount;
+            canvas.fillRect(pbX + 1, pbY + 1, fill, pbH - 2, CLR_TEXT);
+        }
+
+        // Next task
+        bool foundNext = false;
+        for (int i = 0; i < taskCount; i++) {
+            if (!tasks[i].completed) {
+                canvas.setFont(&fonts::Font0);
+                canvas.drawString("NEXT", 6, 146);
+                canvas.setFont(&fonts::FreeSansBold9pt7b);
+                char tt[40]; UI::truncPx(canvas, tt, tasks[i].title, SCREEN_W - 12);
+                canvas.drawString(tt, 6, 158);
+                foundNext = true;
+                break;
+            }
+        }
+        if (!foundNext) {
+            canvas.setFont(&fonts::FreeSansBold9pt7b);
+            const char* msg = "All done for today";
+            int aw = canvas.textWidth(msg);
+            canvas.drawString(msg, (SCREEN_W - aw) / 2, 158);
+        }
     }
 
-    // Sunsamagotchi sleeping footer
-    UI::drawDottedLine(canvas, 168);
+    // ── Footer status strip (always present) ──────────────────────────────────
+    UI::drawDottedLine(canvas, 184);
     canvas.setFont(&fonts::Font0);
     canvas.setTextColor(CLR_TEXT);
-    int smw = canvas.textWidth("Sunsamagotchi is sleeping  zZZ");
-    canvas.drawString("Sunsamagotchi is sleeping  zZZ", (SCREEN_W - smw) / 2, 172);
-    int pmw = canvas.textWidth("Press button to wake");
-    canvas.drawString("Press button to wake", (SCREEN_W - pmw) / 2, 183);
+    char foot[32];
+    snprintf(foot, sizeof(foot), "sync %s", ageStr);
+    canvas.drawString(foot, 4, 190);
+    char battStr[12];
+    snprintf(battStr, sizeof(battStr), "%d%%", batt);
+    int bw = canvas.textWidth(battStr);
+    canvas.drawString(battStr, SCREEN_W - bw - 4, 190);
 
 #else
     // ── StickC 240x135: always-on sleep display ───────────────────────────────
@@ -857,7 +1016,10 @@ void enterDeepSleep() {
 
     pushDisplay();
 
-    HAL::setupWakeSources(appSettings.sleepMinutes);
+    // Wake every 60 s to update the displayed clock (partial refresh).
+    // WiFi/MCP fetches only happen when refreshMinutes have elapsed since the
+    // last successful fetch — see the timer-wake branch in setup().
+    HAL::setupWakeSources(60);
     HAL::enterSleep();
 }
 
@@ -909,46 +1071,60 @@ void setup() {
     }
 
     // ── Timer wake — update clock display; data refresh only when interval elapsed ──
+    // Goal: keep the displayed clock current to within ~1 min while spending the
+    // absolute minimum time awake.  Steps:
+    //   1. Restore RTC-retained state.
+    //   2. Read the BM8563 hardware RTC and refresh date/time strings.
+    //   3. Re-render the sleep screen with a fast e-ink partial refresh.
+    //   4. Only if refreshMinutes have elapsed: spin up WiFi + MCP and refetch.
+    //   5. Sleep again — wake source already set inside enterDeepSleep().
     if (isTimerWake && restoreStateFromRTC()) {
-        Serial.println("[Wake] Timer wake — clock update");
-
-        HAL::setQualityMode();
-
-        // Read hardware RTC immediately — sets currentTime, currentDate, todayStr,
-        // and also restores system time so time() comparisons work.
         updateTimeFromHardwareRTC();
 
-        // Only do WiFi + data fetch if refresh interval has elapsed
         time_t nowTs;
         time(&nowTs);
-        uint32_t refreshSec = (uint32_t)appSettings.refreshMinutes * 60UL;
-        bool needsDataRefresh = (nowTs - rtcLastDataFetch >= (time_t)refreshSec)
-                             || rtcLastDataFetch == 0;
+        uint32_t refreshSec = (uint32_t)effectiveRefreshMinutes() * 60UL;
+        bool needsDataRefresh =
+            (rtcLastDataFetch == 0) ||
+            (nowTs > rtcLastDataFetch && (uint32_t)(nowTs - rtcLastDataFetch) >= refreshSec);
 
-        if (needsDataRefresh) {
-            Serial.println("[Wake] Data refresh due — connecting WiFi");
-            if (connectWiFi()) {
-                syncTime();
-                syncHardwareRTC();
-                updateTimeStrings();
-                if (mcp.begin()) {
-                    mcpReady = true;
-                    bool ok = true;
-                    ok &= mcp.fetchTasks(todayStr, tasks, taskCount, MAX_TASKS);
-                    ok &= mcp.fetchEvents(todayStr, events, eventCount, MAX_EVENTS);
-                    ok &= mcp.fetchTimer(timerInfo);
-                    ok &= mcp.fetchPlanSummary(todayStr, planSummary);
-                    if (timerInfo.active) {
-                        time(&rtcTimerFetchedAt);
-                        rtcTimerElapsedAtFetch = timerInfo.elapsedSec;
-                    } else {
-                        rtcTimerFetchedAt = 0;
-                        rtcTimerElapsedAtFetch = 0;
-                    }
-                    dataLoaded = ok;
-                    time(&rtcLastDataFetch);
-                    if (!ok) Serial.println("[Data] Some fetches failed");
+        Serial.printf("[Wake] Timer wake — clock=%s refresh_due=%d (last=%lld now=%lld)\n",
+                      currentTime, (int)needsDataRefresh,
+                      (long long)rtcLastDataFetch, (long long)nowTs);
+
+        if (!needsDataRefresh) {
+            // Fast path: just redraw the sleep screen with the new clock and
+            // re-enter deep sleep.  No radio, no MCP, no NTP — ~300 ms awake.
+            enterDeepSleep();
+            return;
+        }
+
+        // Slow path: connect WiFi, refresh data, redraw, sleep again.
+        Serial.println("[Wake] Data refresh due — connecting WiFi");
+        if (connectWiFi()) {
+            syncTime();
+            syncHardwareRTC();
+            updateTimeStrings();
+            if (mcp.begin()) {
+                mcpReady = true;
+                bool ok = true;
+                ok &= mcp.fetchTasks(todayStr, tasks, taskCount, MAX_TASKS);
+                ok &= mcp.fetchEvents(todayStr, events, eventCount, MAX_EVENTS);
+                ok &= mcp.fetchTimer(timerInfo);
+                ok &= mcp.fetchPlanSummary(todayStr, planSummary);
+                if (timerInfo.active) {
+                    time(&rtcTimerFetchedAt);
+                    rtcTimerElapsedAtFetch = timerInfo.elapsedSec;
+                } else {
+                    rtcTimerFetchedAt = 0;
+                    rtcTimerElapsedAtFetch = 0;
                 }
+                dataLoaded = ok;
+                if (ok) {
+                    time(&rtcLastDataFetch);
+                    saveStateToRTC();
+                }
+                if (!ok) Serial.println("[Data] Some fetches failed");
             }
         }
         enterDeepSleep();
@@ -1038,21 +1214,55 @@ void loop() {
     uint32_t now = millis();
 
     // ── Deferred WiFi connect (non-blocking wake) ──
+    // When WiFi associates, kick off mcp.begin() + the data fetch on Core 0 so
+    // the UI on Core 1 stays fully responsive (no more 20-second freeze).
     if (pendingWiFiConnect) {
         if (WiFi.status() == WL_CONNECTED) {
             pendingWiFiConnect = false;
             Serial.printf("[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-            // No NTP on button wake — BM8563 hardware RTC is accurate enough
-            if (mcp.begin()) {
-                mcpReady = true;
-                fetchAllData();
-            }
+            // mcp.begin() is a blocking TLS handshake; run it on the fetch task
+            // by piggy-backing on startAsyncFetch (which checks mcpReady first).
+            // We launch a tiny init task here that does begin() then triggers a fetch.
+            xTaskCreatePinnedToCore(
+                [](void*) {
+                    if (!mcpReady) {
+                        if (mcp.begin()) mcpReady = true;
+                    }
+                    if (mcpReady) {
+                        // Inline the fetch body here so we don't race with
+                        // startAsyncFetch() guards.
+                        bool ok = true;
+                        stageTaskCount = 0;
+                        stageEventCount = 0;
+                        memset(&stageTimer, 0, sizeof(stageTimer));
+                        memset(&stagePlan,  0, sizeof(stagePlan));
+                        ok &= mcp.fetchTasks(todayStr, stageTasks, stageTaskCount, MAX_TASKS);
+                        ok &= mcp.fetchEvents(todayStr, stageEvents, stageEventCount, MAX_EVENTS);
+                        ok &= mcp.fetchTimer(stageTimer);
+                        ok &= mcp.fetchPlanSummary(todayStr, stagePlan);
+                        asyncFetchOk      = ok;
+                        asyncFetchDone    = true;
+                    }
+                    asyncFetchRunning = false;
+                    asyncFetchHandle  = nullptr;
+                    vTaskDelete(nullptr);
+                },
+                "mcpInit", 16384, nullptr, 1, &asyncFetchHandle, 0);
+            asyncFetchRunning = true;
+            fetchInProgress   = true;
             lastRefresh = millis();
         } else if (now - wifiConnectStart > 30000) {
             pendingWiFiConnect = false;
             Serial.println("[WiFi] Connection timeout");
         }
     }
+
+    // ── Commit async fetch results into live state ──
+    commitAsyncFetch();
+    // commitAsyncFetch() may have just set lastRefresh = millis() (a value
+    // newer than the `now` captured at the top of loop()).  Refresh `now` so
+    // the auto-refresh check below doesn't see a uint32_t underflow.
+    now = millis();
 
     // ── Time & timer display update ──
     static uint32_t lastTimeUpdate = 0;
@@ -1079,9 +1289,13 @@ void loop() {
     }
 #endif
 
-    // Background data refresh (interval from settings) — no loading screen
-    uint32_t refreshInterval = (uint32_t)appSettings.refreshMinutes * 60000UL;
-    if (mcpReady && now - lastRefresh > refreshInterval && !fetchInProgress) {
+    // Background data refresh (interval from settings) — no loading screen.
+    // Uses the timer-aware effective interval so a running timer doesn't burn
+    // battery on per-3-min API calls.
+    uint32_t refreshInterval = (uint32_t)effectiveRefreshMinutes() * 60000UL;
+    if (mcpReady && !fetchInProgress
+        && now >= lastRefresh
+        && (now - lastRefresh) >= refreshInterval) {
         Serial.println("[Auto] Background refresh");
         fetchAllData();
     }
@@ -1097,9 +1311,16 @@ void loop() {
     }
 #endif
 
-    // Auto sleep (timeout from settings)
+    // Auto sleep (timeout from settings).  Don't sleep if a fetch is in flight —
+    // it would kill the TLS connection and leave us with stale data.  Extend
+    // the activity window slightly to wait for it to complete.
     if (now - lastActivity > appSettings.activeTimeoutMs) {
-        enterDeepSleep();
+        if (fetchInProgress) {
+            // Keep waking the user-activity logic briefly while the fetch runs.
+            lastActivity = now - appSettings.activeTimeoutMs + 2000;
+        } else {
+            enterDeepSleep();
+        }
     }
 
     delay(50);
