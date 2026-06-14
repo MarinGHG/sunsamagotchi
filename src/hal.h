@@ -3,7 +3,9 @@
 #pragma once
 
 #include <M5Unified.h>
+#include <WiFi.h>
 #include <driver/rtc_io.h>
+#include <esp_wifi.h>
 
 // ─── Board Detection ────────────────────────────────────────────────────────
 #if !defined(BOARD_COREINK) && !defined(BOARD_M5STICK_CPLUS2)
@@ -207,8 +209,20 @@ inline void setupWakeSources(uint32_t wakeSec = WAKE_INTERVAL_SEC) {
 }
 
 inline void enterSleep() {
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
+    // Cleanly shut down WiFi before deep sleep.  This matters most after a
+    // slow-path refresh wake, where WiFi was active up to ~50 ms ago: if
+    // esp_deep_sleep_start runs while the WiFi MAC/PHY is still tearing down,
+    // the deep-sleep wake sources can be left in a corrupted state and the
+    // timer wake never fires — the device appears to "stick" on the standby
+    // screen and only wakes via the dial.  esp_wifi_stop() is the synchronous
+    // shutdown call; the Arduino WiFi.mode(OFF) wrapper is async and returns
+    // before the radio is fully down.
+    if (WiFi.getMode() != WIFI_OFF) {
+        WiFi.disconnect(true, false);
+        esp_wifi_stop();
+        WiFi.mode(WIFI_OFF);
+        delay(100);
+    }
 #if IS_EINK
     // Wait for the in-flight refresh to complete, then issue POF (Power Off)
     // via setPowerSave(true).  We deliberately skip the full DSLP command:

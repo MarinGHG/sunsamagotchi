@@ -47,6 +47,28 @@ Settings persist across reboots via NVS.
 | Front (BtnA) | Scroll / cycle items | Complete / start / toggle |
 | Side (BtnB) | Next screen | Force refresh |
 
+## Flashing
+
+Two ways to get firmware onto a device.
+
+### Option A — Web flasher (easiest, no toolchain)
+
+The quickest path: **[sunsamagotchi.marinbenke.dev](https://sunsamagotchi.marinbenke.dev)**.
+
+A browser-based flasher patches your credentials into the firmware **entirely in your
+browser** and writes it over WebSerial. Your WiFi password and Sunsama token never leave
+your machine — the site is static and the values are injected client-side just before
+flashing.
+
+1. Open the flasher in **Chrome or Edge on desktop** (Safari/Firefox lack WebSerial).
+2. Pick your board, enter WiFi SSID/password, Sunsama Bearer token, and timezone offset.
+3. Plug the device in via USB, click **Connect**, pick the serial port, and **Flash**.
+
+### Option B — Build from source (manual, full control)
+
+For development, or if you'd rather not use the web flasher — build and upload with
+PlatformIO. See [Setup](#setup) below.
+
 ## Setup
 
 ### 1. Configure credentials
@@ -88,9 +110,9 @@ pio device monitor
 ```
 ┌──────────────────┐    HTTPS POST       ┌──────────────────┐
 │  CoreInk / StickC│ ── JSON-RPC 2.0 ──> │ api.sunsama.com  │
-│  ESP32           │ <─ application/json  │     /mcp         │
-│  HAL abstraction │    or SSE stream     │                  │
-└──────────────────┘                      └──────────────────┘
+│  ESP32           │ <─ application/json │     /mcp         │
+│  HAL abstraction │    or SSE stream    │                  │
+└──────────────────┘                     └──────────────────┘
 ```
 
 MCP operations used:
@@ -110,6 +132,17 @@ src/
 ├── mcp_client.h   — MCP Streamable HTTP client (JSON-RPC over HTTPS)
 └── ui.h           — all drawing routines, 6 screens
 ```
+
+## Development
+
+### Firmware
+
+Edit under `src/`, build/upload with PlatformIO (Option B above). `pio device monitor`
+at 115200 baud for serial logs. The HAL in `hal.h` abstracts both boards behind one
+interface — add a board by extending it plus a `-D` flag in `platformio.ini`.
+
+The browser-based [web flasher](https://sunsamagotchi.marinbenke.dev) is maintained
+separately from this firmware repo.
 
 ## License
 

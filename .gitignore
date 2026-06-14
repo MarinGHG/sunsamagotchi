@@ -1,6 +1,11 @@
 # Build artifacts
 .pio/
 
+# Web flasher — lives in a separate project, not part of the firmware repo
+web/
+scripts/build-web-firmware.sh
+src/config.h.web-flash
+
 # Credentials — copy config.h.example to config.h and fill in your own
 src/config.h
 !src/config.h.example

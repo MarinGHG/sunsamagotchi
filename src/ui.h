@@ -124,6 +124,34 @@ inline void drawIcon8(M5Canvas& c, int x, int y, const uint8_t* icon, uint16_t c
     }
 }
 
+// ── Parse "H:MM AM/PM" from API to minutes-of-day (-1 if unparsable) ────────
+inline int apiTimeToMinutes(const char* apiTime) {
+    if (!apiTime || !apiTime[0]) return -1;
+    int h = 0, m = 0;
+    char ampm[4] = "";
+    int n = sscanf(apiTime, "%d:%d %2s", &h, &m, ampm);
+    if (n < 2) return -1;
+    if (ampm[0] == 'P' && h != 12) h += 12;
+    if (ampm[0] == 'A' && h == 12) h = 0;
+    if (h < 0 || h > 23 || m < 0 || m > 59) return -1;
+    return h * 60 + m;
+}
+
+// True if a calendar event has already ended given the current local time.
+// Sunsama auto-completes events whose end is in the past; we mirror that
+// purely client-side because the events resource doesn't expose a completed
+// flag (only title/startTime/duration/isAllDay).
+inline bool eventIsPast(const EventItem& e) {
+    if (e.isAllDay) return false;
+    struct tm now_tm;
+    if (!getLocalTime(&now_tm, 0)) return false;
+    int nowMins = now_tm.tm_hour * 60 + now_tm.tm_min;
+    int evStart = apiTimeToMinutes(e.startTime);
+    if (evStart < 0) return false;
+    int evEnd = evStart + (int)e.durationMin;
+    return evEnd <= nowMins;
+}
+
 // ── Convert "H:MM AM/PM" from API to 24h based on runtime setting ───────────
 inline void formatApiTime(char* out, size_t outSz, const char* apiTime, bool use24h = true) {
     if (!apiTime || !apiTime[0]) { out[0] = '\0'; return; }
@@ -195,23 +223,38 @@ inline void trunc(char* dst, const char* src, int maxChars) {
 }
 
 // ── Pixel-width-based truncation ────────────────────────────────────────────
-inline void truncPx(M5Canvas& c, char* dst, const char* src, int maxPx) {
-    int len = strlen(src);
+// The implementation takes the destination size explicitly; the templated
+// wrapper below lets callers pass a stack array directly and infer the size
+// at compile time, so we get bounds-checked writes even when the source
+// string fits the pixel budget but not the destination buffer.  (This was a
+// real bug — long task titles fit horizontally on screen but overflowed the
+// 24-/30-byte tt[] buffers, tripping the stack canary and rebooting.)
+inline void truncPxImpl(M5Canvas& c, char* dst, size_t dstSz,
+                         const char* src, int maxPx) {
+    if (!dst || dstSz == 0) return;
+    if (!src) { dst[0] = '\0'; return; }
     if (c.textWidth(src) <= maxPx) {
-        strcpy(dst, src);
+        strlcpy(dst, src, dstSz);
         return;
     }
-    for (int n = len - 1; n > 2; n--) {
-        char tmp[50];
+    char tmp[64];
+    int len = (int)strlen(src);
+    if (len > (int)sizeof(tmp) - 3) len = (int)sizeof(tmp) - 3;
+    for (int n = len; n > 2; n--) {
         strncpy(tmp, src, n);
         tmp[n] = '\0';
         strcat(tmp, "..");
         if (c.textWidth(tmp) <= maxPx) {
-            strcpy(dst, tmp);
+            strlcpy(dst, tmp, dstSz);
             return;
         }
     }
-    strcpy(dst, "..");
+    strlcpy(dst, "..", dstSz);
+}
+
+template<size_t N>
+inline void truncPx(M5Canvas& c, char (&dst)[N], const char* src, int maxPx) {
+    truncPxImpl(c, dst, N, src, maxPx);
 }
 
 // ── Format elapsed timer as minutes only ────────────────────────────────────
@@ -664,26 +707,39 @@ inline void drawEventsScreen(M5Canvas& c, EventItem* events, uint8_t eventCount,
         c.drawString("Enjoy your day!", (SCREEN_W - ew) / 2, BODY_TOP + (BODY_BOT - BODY_TOP) / 2 + 4);
     } else {
 #if IS_EINK
-        // CoreInk 200x200: vertical event cards
+        // CoreInk 200x200: vertical event cards.
+        //
+        // Layout per card (eventH = 30 px):
+        //   col 0..7  → leading marker (accent bar = upcoming, check = past)
+        //   col 12..  → row 1: time text + inline duration tag
+        //              row 2: title text
+        //
+        // Duration is drawn INLINE on the time row (not floating top-right)
+        // so it never collides with the up-arrow scroll indicator.
+        // Past events are marked with a check icon instead of a strike-through.
         int yOff = BODY_TOP + 2;
         int eventH = 30;
         int evMaxVis = (BODY_BOT - yOff) / eventH;
+        const int textX = PAD + 12;  // leaves room for accent bar OR check icon
         for (int i = scrollOff; i < eventCount && (i - scrollOff) < evMaxVis; i++) {
             EventItem& e = events[i];
-            c.fillRect(PAD, yOff, 3, eventH - 4, CLR_ACCENT);
+            bool past = eventIsPast(e);
 
-            c.setFont(&fonts::FreeSansBold9pt7b);
-            if (e.isAllDay) {
-                c.drawString("All Day", PAD + 8, yOff);
+            // Leading marker
+            if (past) {
+                drawIcon8(c, PAD, yOff + (eventH - 4 - 8) / 2, ICON_CHECK, CLR_TEXT);
+                c.setTextColor(CLR_TEXT_DIM);
             } else {
-                char t24[12];
-                formatApiTime(t24, sizeof(t24), e.startTime, use24h);
-                c.drawString(t24, PAD + 8, yOff);
+                c.fillRect(PAD, yOff, 3, eventH - 4, CLR_ACCENT);
             }
 
-            c.setFont(&fonts::Font2);
-            char tt[30]; truncPx(c, tt, e.title, SCREEN_W - PAD * 2 - 12);
-            c.drawString(tt, PAD + 8, yOff + 14);
+            // Row 1: time + inline duration tag
+            c.setFont(&fonts::FreeSansBold9pt7b);
+            char timeStr2[12];
+            if (e.isAllDay) strlcpy(timeStr2, "All Day", sizeof(timeStr2));
+            else formatApiTime(timeStr2, sizeof(timeStr2), e.startTime, use24h);
+            c.drawString(timeStr2, textX, yOff);
+            int timeW = c.textWidth(timeStr2);
 
             if (!e.isAllDay && e.durationMin > 0) {
                 char dur[10];
@@ -693,14 +749,27 @@ inline void drawEventsScreen(M5Canvas& c, EventItem* events, uint8_t eventCount,
                     snprintf(dur, sizeof(dur), "%dm", e.durationMin);
                 c.setFont(&fonts::Font0);
                 int dw2 = c.textWidth(dur);
-                c.drawRect(SCREEN_W - dw2 - 8, yOff + 2, dw2 + 6, 12, CLR_TEXT);
-                c.drawString(dur, SCREEN_W - dw2 - 5, yOff + 3);
+                // Generous padding: 5 px horizontal, ~2 px vertical, height 14
+                int boxX = textX + timeW + 8;
+                int boxY = yOff + 1;
+                int boxW = dw2 + 10;
+                int boxH = 14;
+                c.drawRect(boxX, boxY, boxW, boxH, CLR_TEXT);
+                c.drawString(dur, boxX + 5, boxY + 3);
             }
 
+            // Row 2: title
+            c.setFont(&fonts::Font2);
+            char tt[40]; truncPx(c, tt, e.title, SCREEN_W - textX - PAD);
+            c.drawString(tt, textX, yOff + 14);
+
+            // Restore text color if dimmed for past
+            if (past) c.setTextColor(CLR_TEXT);
+
             yOff += eventH;
-            if (i < eventCount - 1) drawDottedLine(c, yOff - 2, PAD + 8, SCREEN_W - PAD);
+            if (i < eventCount - 1) drawDottedLine(c, yOff - 2, textX, SCREEN_W - PAD);
         }
-        // Scroll indicators
+        // Scroll indicators (top-right & bottom-right; clear of inline duration)
         if (scrollOff > 0) {
             c.fillTriangle(SCREEN_W - 10, BODY_TOP + 3, SCREEN_W - 14, BODY_TOP + 7, SCREEN_W - 6, BODY_TOP + 7, CLR_TEXT);
         }
@@ -709,56 +778,65 @@ inline void drawEventsScreen(M5Canvas& c, EventItem* events, uint8_t eventCount,
             c.fillTriangle(SCREEN_W - 10, by + 4, SCREEN_W - 14, by, SCREEN_W - 6, by, CLR_TEXT);
         }
 #else
-        // StickC 240x135: compact event rows
+        // StickC 240x135: compact one-row event cards.
+        // Layout: [marker][time] [duration tag] [title fills rest]
+        // Past events use a check icon in place of the accent bar (no strike).
         int yOff = BODY_TOP + 2;
         int eventH = 22;
         int evMaxVis = (BODY_BOT - yOff) / eventH;
+        const int textX = PAD + 11;  // room for 8 px check icon or 2 px bar
         for (int i = scrollOff; i < eventCount && (i - scrollOff) < evMaxVis; i++) {
             EventItem& e = events[i];
-            c.fillRect(PAD, yOff + 2, 2, eventH - 6, CLR_ACCENT);
+            bool past = eventIsPast(e);
+
+            // Leading marker
+            if (past) {
+                drawIcon8(c, PAD, yOff + (eventH - 8) / 2, ICON_CHECK, CLR_TEXT_DIM);
+                c.setTextColor(CLR_TEXT_DIM);
+            } else {
+                c.fillRect(PAD, yOff + 2, 2, eventH - 6, CLR_ACCENT);
+            }
 
             // Time
             c.setFont(&fonts::Font2);
             char timeStr2[16];
-            if (e.isAllDay) {
-                strlcpy(timeStr2, "All Day", sizeof(timeStr2));
-            } else {
-                formatApiTime(timeStr2, sizeof(timeStr2), e.startTime, use24h);
-            }
-            c.drawString(timeStr2, PAD + 6, yOff + 1);
+            if (e.isAllDay) strlcpy(timeStr2, "All Day", sizeof(timeStr2));
+            else formatApiTime(timeStr2, sizeof(timeStr2), e.startTime, use24h);
+            c.drawString(timeStr2, textX, yOff + 1);
+            int timeW = c.textWidth(timeStr2);
 
-            // Title after time
-            int timeW = c.textWidth(timeStr2) + 8;
-            int titleMaxPx = SCREEN_W - PAD * 2 - timeW - 6;
-
-            // Duration badge
-            char dur[10] = "";
-            int durW = 0;
+            // Inline duration tag right after time (no longer floats top-right,
+            // so it can never overlap the scroll-up arrow).
+            int afterTagX = textX + timeW + 4;
             if (!e.isAllDay && e.durationMin > 0) {
+                char dur[10];
                 if (e.durationMin >= 60)
                     snprintf(dur, sizeof(dur), "%dh%02d", e.durationMin / 60, e.durationMin % 60);
                 else
                     snprintf(dur, sizeof(dur), "%dm", e.durationMin);
                 c.setFont(&fonts::Font0);
-                durW = c.textWidth(dur) + 8;
-                titleMaxPx -= durW;
+                int dw2 = c.textWidth(dur);
+                int boxX = afterTagX;
+                int boxY = yOff + 3;
+                int boxW = dw2 + 8;       // 4 px h-padding inside
+                int boxH = 13;            // a bit taller for breathing room
+                c.drawRect(boxX, boxY, boxW, boxH, past ? CLR_TEXT_DIM : CLR_TEXT);
+                c.drawString(dur, boxX + 4, boxY + 3);
+                afterTagX = boxX + boxW + 5;
                 c.setFont(&fonts::Font2);
             }
 
-            char tt[30]; truncPx(c, tt, e.title, titleMaxPx);
-            c.drawString(tt, PAD + 6 + timeW, yOff + 1);
+            // Title fills the remaining space
+            int titleMaxPx = SCREEN_W - afterTagX - PAD;
+            char tt[40]; truncPx(c, tt, e.title, titleMaxPx);
+            c.drawString(tt, afterTagX, yOff + 1);
 
-            if (dur[0]) {
-                c.setFont(&fonts::Font0);
-                int dw2 = c.textWidth(dur);
-                c.drawRect(SCREEN_W - dw2 - 7, yOff + 3, dw2 + 5, 12, CLR_TEXT);
-                c.drawString(dur, SCREEN_W - dw2 - 5, yOff + 4);
-            }
+            if (past) c.setTextColor(CLR_TEXT);
 
             yOff += eventH;
-            if (i < eventCount - 1) drawDottedLine(c, yOff - 2, PAD + 6, SCREEN_W - PAD);
+            if (i < eventCount - 1) drawDottedLine(c, yOff - 2, textX, SCREEN_W - PAD);
         }
-        // Scroll indicators
+        // Scroll indicators (top-right & bottom-right; clear of inline duration)
         if (scrollOff > 0) {
             c.fillTriangle(SCREEN_W - 10, BODY_TOP + 3, SCREEN_W - 14, BODY_TOP + 7, SCREEN_W - 6, BODY_TOP + 7, CLR_TEXT);
         }

@@ -4,6 +4,7 @@
 #include <M5Unified.h>
 #include <WiFi.h>
 #include <time.h>
+#include <sys/time.h>
 #include <esp_sleep.h>
 #include "config.h"
 #include "hal.h"
@@ -33,13 +34,14 @@ RTC_DATA_ATTR uint8_t   rtcEventScrollOff = 0;
 RTC_DATA_ATTR uint8_t   rtcTimerScrollOff = 0;
 RTC_DATA_ATTR time_t    rtcTimerFetchedAt = 0;       // system time when timer was last fetched
 RTC_DATA_ATTR uint32_t  rtcTimerElapsedAtFetch = 0;  // elapsedSec at that moment
-// Counts timer-driven wakes since the last full-clearing refresh.  Partial
-// (DU / "fastest") refreshes accumulate ghosting; we periodically run one
-// full epd_quality refresh to clear it.
+// Counts timer-driven wakes.  Minute standby redraws stay on the same fast
+// partial waveform used by normal UI navigation.
 RTC_DATA_ATTR uint16_t  rtcWakeCounter = 0;
-// How many consecutive partial refreshes before we force one full clear.
-// 30 wakes ≈ 30 minutes when waking once per minute.
-#define FULL_REFRESH_EVERY 30
+#define FULL_REFRESH_EVERY 0
+// Battery-life estimation: store a baseline % + timestamp.  Reset on charge
+// (battery jumps up).  ETA = remaining% / drain-rate.
+RTC_DATA_ATTR int8_t    rtcBattRefPct = -1;
+RTC_DATA_ATTR time_t    rtcBattRefTs  = 0;
 // When a timer is active we already track elapsed locally and don't need the
 // API for the second-by-second value — we only need to occasionally check if
 // the timer was stopped on another device.  This is the floor (in minutes)
@@ -139,6 +141,8 @@ bool connectWiFi() {
 
 // ─── NTP Time ───────────────────────────────────────────────────────────────
 void syncTime() {
+    struct timeval resetTv = { 0, 0 };
+    settimeofday(&resetTv, nullptr);
     configTime(TZ_OFFSET_SEC, 0, NTP_SERVER);
     struct tm timeinfo;
     int tries = 0;
@@ -146,7 +150,16 @@ void syncTime() {
         delay(500);
         tries++;
     }
-    Serial.println(tries < 10 ? "[NTP] Time synced" : "[NTP] Sync failed");
+    if (tries < 10) {
+        struct tm tmLocal;
+        getLocalTime(&tmLocal);
+        time_t epoch; time(&epoch);
+        char ls[20]; strftime(ls, sizeof(ls), "%Y-%m-%d %H:%M:%S", &tmLocal);
+        Serial.printf("[NTP] Time synced — local=%s utc_epoch=%lld\n",
+                      ls, (long long)epoch);
+    } else {
+        Serial.println("[NTP] Sync failed");
+    }
 }
 
 // ── Write system time to hardware RTC (BM8563) after NTP sync ───────────────
@@ -165,8 +178,15 @@ void syncHardwareRTC() {
     dt.time.hours   = utc.tm_hour;
     dt.time.minutes = utc.tm_min;
     dt.time.seconds = utc.tm_sec;
+    Serial.printf("[RTC] WRITE  y%d-%02d-%02d %02d:%02d:%02d UTC (epoch=%lld)\n",
+                  dt.date.year, dt.date.month, dt.date.date,
+                  dt.time.hours, dt.time.minutes, dt.time.seconds,
+                  (long long)now);
     M5.Rtc.setDateTime(dt);
-    Serial.println("[RTC] Hardware RTC synced from NTP");
+    auto rb = M5.Rtc.getDateTime();
+    Serial.printf("[RTC] RBACK  y%d-%02d-%02d %02d:%02d:%02d UTC\n",
+                  rb.date.year, rb.date.month, rb.date.date,
+                  rb.time.hours, rb.time.minutes, rb.time.seconds);
 }
 
 // Read time directly from hardware RTC (BM8563) — instant, no WiFi needed.
@@ -174,6 +194,9 @@ void syncHardwareRTC() {
 // We adjust for TZ_OFFSET_SEC and also set the system clock so time() works.
 void updateTimeFromHardwareRTC() {
     auto dt = M5.Rtc.getDateTime();
+    Serial.printf("[RTC] READ   y%d-%02d-%02d %02d:%02d:%02d UTC\n",
+                  dt.date.year, dt.date.month, dt.date.date,
+                  dt.time.hours, dt.time.minutes, dt.time.seconds);
     int tzH    = TZ_OFFSET_SEC / 3600;
     int localH = (dt.time.hours + tzH + 24) % 24;
 
@@ -214,6 +237,44 @@ void updateTimeFromHardwareRTC() {
     if (utcTs > 0) {
         struct timeval tv = { utcTs, 0 };
         settimeofday(&tv, nullptr);
+    }
+}
+
+// ─── Battery-life ETA ───────────────────────────────────────────────────────
+// Tracks battery level over time across deep-sleep cycles.  Returns -1 if we
+// don't yet have enough history for a meaningful estimate.  Resets baseline
+// when the battery jumps up (charging).
+static void updateBatteryTracking(int curPct) {
+    time_t nowTs; time(&nowTs);
+    if (nowTs < 1600000000) return;  // clock not set yet
+    if (rtcBattRefPct < 0 || curPct > rtcBattRefPct + 5) {
+        // First boot, or device was put on charger — reset baseline.
+        rtcBattRefPct = (int8_t)curPct;
+        rtcBattRefTs  = nowTs;
+        Serial.printf("[Batt] Baseline reset: %d%% @ %lld\n",
+                      curPct, (long long)nowTs);
+    }
+}
+
+// Format ETA like "~5d", "~14h", or "" if unknown.
+static void formatBatteryEta(char* out, size_t sz, int curPct) {
+    out[0] = '\0';
+    time_t nowTs; time(&nowTs);
+    if (rtcBattRefPct < 0 || rtcBattRefTs == 0 || nowTs <= rtcBattRefTs) return;
+    int dropped = rtcBattRefPct - curPct;
+    uint32_t elapsed = (uint32_t)(nowTs - rtcBattRefTs);
+    // Need at least ~30 min and ≥1% drop for a stable rate.
+    if (dropped < 1 || elapsed < 1800) return;
+    if (curPct <= 0) { strlcpy(out, "low", sz); return; }
+    float pctPerSec = (float)dropped / (float)elapsed;
+    if (pctPerSec <= 0.0f) return;
+    float secsLeft = (float)curPct / pctPerSec;
+    if (secsLeft >= 86400.0f) {
+        snprintf(out, sz, "~%dd", (int)(secsLeft / 86400.0f));
+    } else if (secsLeft >= 3600.0f) {
+        snprintf(out, sz, "~%dh", (int)(secsLeft / 3600.0f));
+    } else {
+        snprintf(out, sz, "~%dm", (int)(secsLeft / 60.0f));
     }
 }
 
@@ -785,9 +846,8 @@ void handleButtons() {
 // Design notes for the standby screen:
 //   • Desk-readable.  Clock and (if running) timer are the focal points and
 //     are sized large enough to read across a desk.
-//   • E-ink partial refresh.  Most wakes use epd_fastest (DU waveform) so the
-//     panel updates without a black flash.  Every FULL_REFRESH_EVERY wakes we
-//     do one full epd_quality refresh to clear any accumulated ghosting.
+//   • E-ink partial refresh.  Wakes use epd_fastest (DU waveform) so the
+//     panel updates like normal UI navigation.
 //   • Two layouts, depending on whether a timer is active.  When a timer is
 //     running it owns the centre of the screen; the clock and date shrink to
 //     a small status bar at the top.
@@ -800,18 +860,16 @@ void enterDeepSleep() {
     saveStateToRTC();
 
 #if IS_EINK
-    // Pick refresh mode: every Nth wake force a clean full refresh, otherwise
-    // use the fastest partial waveform (no flash, mild ghosting).
     rtcWakeCounter++;
-    bool fullRefresh = (rtcWakeCounter % FULL_REFRESH_EVERY) == 0;
-    M5.Display.setEpdMode(fullRefresh ? epd_mode_t::epd_quality
-                                       : epd_mode_t::epd_fastest);
+    M5.Display.setEpdMode(epd_mode_t::epd_fastest);
 #endif
     canvas.fillSprite(CLR_BG);
     updateTimeStrings();
 
     int batt = M5.Power.getBatteryLevel();
     if (batt < 0) batt = 0; if (batt > 100) batt = 100;
+    updateBatteryTracking(batt);
+    char etaStr[12]; formatBatteryEta(etaStr, sizeof(etaStr), batt);
 
     // Format minutes-since-last-fetch for the status footer
     char ageStr[16] = "—";
@@ -919,8 +977,9 @@ void enterDeepSleep() {
     char foot[32];
     snprintf(foot, sizeof(foot), "sync %s", ageStr);
     canvas.drawString(foot, 4, 190);
-    char battStr[12];
-    snprintf(battStr, sizeof(battStr), "%d%%", batt);
+    char battStr[20];
+    if (etaStr[0]) snprintf(battStr, sizeof(battStr), "%d%% %s", batt, etaStr);
+    else           snprintf(battStr, sizeof(battStr), "%d%%", batt);
     int bw = canvas.textWidth(battStr);
     canvas.drawString(battStr, SCREEN_W - bw - 4, 190);
 
@@ -1008,8 +1067,10 @@ void enterDeepSleep() {
     canvas.setFont(&fonts::Font0);
     canvas.setTextColor(CLR_TEXT_DIM);
     canvas.drawString("Press FRONT to wake", 4, SCREEN_H - 12);
-    char refBuf[24];
-    snprintf(refBuf, sizeof(refBuf), "refresh: %dmin", appSettings.refreshMinutes);
+    char refBuf[32];
+    if (etaStr[0]) snprintf(refBuf, sizeof(refBuf), "%d%% %s", batt, etaStr);
+    else           snprintf(refBuf, sizeof(refBuf), "%d%% (refresh %dm)",
+                            batt, appSettings.refreshMinutes);
     int rbw = canvas.textWidth(refBuf);
     canvas.drawString(refBuf, SCREEN_W - rbw - 4, SCREEN_H - 12);
 #endif
