@@ -2,6 +2,8 @@
 
 A tiny hardware companion for your desk that shows your current Sunsama tasks, lets you check them off, and starts a timer — all synced live with your Sunsama account.
 
+[Full writeup →](https://marinbenke.dev/en/blog/sunsama-gotchi) · [Web flasher →](https://sunsamagotchi.marinbenke.dev)
+
 Runs on an **M5Stack CoreInk** (200×200 e-paper) or **M5StickC Plus2** (135×240 TFT). Built with PlatformIO and Arduino.
 
 The idea came from a simple frustration: in a world full of digital noise, sometimes you just want one small, focused thing telling you what to do next. No browser tab. No notification badge. Just a clock and a list.
