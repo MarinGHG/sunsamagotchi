@@ -4,11 +4,19 @@
 
 // ─── Persistent Settings (NVS-backed) ───────────────────────────────────────
 
+// Standby (deep-sleep) screen layouts
+enum StandbyScreen : uint8_t {
+    STANDBY_DEFAULT  = 0,  // Clock-focused summary (original)
+    STANDBY_CALENDAR = 1,  // Sunsama-style day timeline (±3h)
+    STANDBY_OPT_COUNT
+};
+
 struct AppSettings {
     uint8_t  sleepMinutes;     // Deep sleep interval (1,5,10,15)
     uint8_t  refreshMinutes;   // Background refresh interval (1,3,5,10)
     bool     use24h;           // 24h time format
     uint32_t activeTimeoutMs;  // Auto-sleep timeout in ms (30000,60000,120000)
+    uint8_t  standbyScreen;    // Standby layout (STANDBY_DEFAULT / STANDBY_CALENDAR)
     bool     introSeen;        // First-run intro/tutorial dismissed
 };
 
@@ -25,6 +33,7 @@ enum SettingsItem : uint8_t {
     SETT_SLEEP_MIN = 0,
     SETT_REFRESH_MIN,
     SETT_TIME_FMT,
+    SETT_STANDBY,
     SETT_ACTIVE_TIMEOUT,
     SETT_COUNT
 };
@@ -39,6 +48,7 @@ inline void load(AppSettings& s) {
     s.refreshMinutes  = _prefs.getUChar("refreshMin", 3);
     s.use24h          = _prefs.getBool("use24h", true);
     s.activeTimeoutMs = _prefs.getULong("activeTO", 60000);
+    s.standbyScreen   = _prefs.getUChar("standby", STANDBY_DEFAULT);
     s.introSeen       = _prefs.getBool("introSeen", false);
     _prefs.end();
 }
@@ -49,6 +59,7 @@ inline void save(const AppSettings& s) {
     _prefs.putUChar("refreshMin", s.refreshMinutes);
     _prefs.putBool("use24h", s.use24h);
     _prefs.putULong("activeTO", s.activeTimeoutMs);
+    _prefs.putUChar("standby", s.standbyScreen);
     _prefs.putBool("introSeen", s.introSeen);
     _prefs.end();
 }
@@ -76,6 +87,9 @@ inline void cycleNext(AppSettings& s, SettingsItem item) {
         }
         case SETT_TIME_FMT:
             s.use24h = !s.use24h;
+            break;
+        case SETT_STANDBY:
+            s.standbyScreen = (s.standbyScreen + 1) % STANDBY_OPT_COUNT;
             break;
         case SETT_ACTIVE_TIMEOUT: {
             for (uint8_t i = 0; i < TIMEOUT_OPT_COUNT; i++) {
@@ -114,6 +128,9 @@ inline void cyclePrev(AppSettings& s, SettingsItem item) {
         case SETT_TIME_FMT:
             s.use24h = !s.use24h;
             break;
+        case SETT_STANDBY:
+            s.standbyScreen = (s.standbyScreen + STANDBY_OPT_COUNT - 1) % STANDBY_OPT_COUNT;
+            break;
         case SETT_ACTIVE_TIMEOUT: {
             for (uint8_t i = 0; i < TIMEOUT_OPT_COUNT; i++) {
                 if (TIMEOUT_OPTIONS[i] == s.activeTimeoutMs) {
@@ -145,6 +162,9 @@ inline void formatValue(char* out, size_t sz, const AppSettings& s, SettingsItem
         case SETT_TIME_FMT:
             snprintf(out, sz, "%s", s.use24h ? "24h" : "12h");
             break;
+        case SETT_STANDBY:
+            snprintf(out, sz, "%s", s.standbyScreen == STANDBY_CALENDAR ? "Calendar" : "Clock");
+            break;
         case SETT_ACTIVE_TIMEOUT:
             snprintf(out, sz, "%lus", (unsigned long)(s.activeTimeoutMs / 1000));
             break;
@@ -159,6 +179,7 @@ inline const char* itemLabel(SettingsItem item) {
         case SETT_SLEEP_MIN:     return "Sleep interval";
         case SETT_REFRESH_MIN:   return "Refresh interval";
         case SETT_TIME_FMT:      return "Time format";
+        case SETT_STANDBY:       return "Standby screen";
         case SETT_ACTIVE_TIMEOUT: return "Active timeout";
         default: return "";
     }
