@@ -6,6 +6,7 @@ on:
     paths:
       - 'src/**'
       - 'platformio.ini'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 permissions:
