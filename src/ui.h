@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include "config.h"
 #include "hal.h"
+#include "net_cfg.h"
 #include "settings.h"
 
 // ─── Screen IDs ─────────────────────────────────────────────────────────────
@@ -1221,7 +1222,7 @@ inline void drawSettingsScreen(M5Canvas& c, const AppSettings& settings,
     c.setTextColor(CLR_TEXT_DIM);
     char info[48];
 #if IS_EINK
-    snprintf(info, sizeof(info), "WiFi: %s  Batt: %d%%", WIFI_SSID, batt);
+    snprintf(info, sizeof(info), "WiFi: %s  Batt: %d%%", NetCfg::ssid(), batt);
     c.drawString(info, PAD + 2, infoY);
     c.drawString("Sunsamagotchi | M5Stack CoreInk", PAD + 2, infoY + 12);
 #else
