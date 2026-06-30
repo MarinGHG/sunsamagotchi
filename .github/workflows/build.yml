@@ -1,0 +1,69 @@
+name: Build Firmware
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'src/**'
+      - 'platformio.ini'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
+          restore-keys: ${{ runner.os }}-pio-
+
+      - name: Install PlatformIO
+        run: pip install --quiet platformio
+
+      - name: Build CoreInk
+        run: pio run -e m5stack-coreink
+
+      - name: Build StickC Plus2
+        run: pio run -e m5stick-cplus2
+
+      - name: Collect binaries
+        run: |
+          mkdir -p dist
+          # CoreInk
+          cp .pio/build/m5stack-coreink/bootloader.bin  dist/coreink-bootloader.bin
+          cp .pio/build/m5stack-coreink/partitions.bin  dist/coreink-partitions.bin
+          cp .pio/build/m5stack-coreink/firmware.bin    dist/coreink-app.bin
+          # StickC
+          cp .pio/build/m5stick-cplus2/bootloader.bin   dist/stickc-bootloader.bin
+          cp .pio/build/m5stick-cplus2/partitions.bin   dist/stickc-partitions.bin
+          cp .pio/build/m5stick-cplus2/firmware.bin     dist/stickc-app.bin
+          ls -lh dist/
+
+      - name: Derive version tag
+        id: tag
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y%m%d)
+          echo "tag=firmware-${DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "name=Firmware ${DATE} (${SHORT_SHA})" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.name }}
+          body: |
+            Auto-built from commit ${{ github.sha }}.
+
+            Flash via the web flasher: https://sunsamagotchi.pages.dev
+          files: dist/*.bin
+          fail_on_unmatched_files: true

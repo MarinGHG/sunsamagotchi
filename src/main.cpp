@@ -7,6 +7,7 @@
 #include <sys/time.h>
 #include <esp_sleep.h>
 #include "config.h"
+#include "net_cfg.h"
 #include "hal.h"
 #include "settings.h"
 #include "ui.h"
@@ -116,12 +117,12 @@ static TaskHandle_t       asyncFetchHandle  = nullptr;
 
 // ─── WiFi ───────────────────────────────────────────────────────────────────
 bool connectWiFi() {
-    Serial.printf("[WiFi] Connecting to %s\n", WIFI_SSID);
+    Serial.printf("[WiFi] Connecting to %s\n", NetCfg::ssid());
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     delay(100);
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    WiFi.begin(NetCfg::ssid(), NetCfg::pass());
 
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 60) {
@@ -143,7 +144,7 @@ bool connectWiFi() {
 void syncTime() {
     struct timeval resetTv = { 0, 0 };
     settimeofday(&resetTv, nullptr);
-    configTime(TZ_OFFSET_SEC, 0, NTP_SERVER);
+    configTime(NetCfg::tzSec(), 0, NTP_SERVER);
     struct tm timeinfo;
     int tries = 0;
     while (!getLocalTime(&timeinfo) && tries < 10) {
@@ -197,7 +198,7 @@ void updateTimeFromHardwareRTC() {
     Serial.printf("[RTC] READ   y%d-%02d-%02d %02d:%02d:%02d UTC\n",
                   dt.date.year, dt.date.month, dt.date.date,
                   dt.time.hours, dt.time.minutes, dt.time.seconds);
-    int tzH    = TZ_OFFSET_SEC / 3600;
+    int tzH    = NetCfg::tzSec() / 3600;
     int localH = (dt.time.hours + tzH + 24) % 24;
 
     if (appSettings.use24h) {
@@ -1117,12 +1118,12 @@ void setup() {
         redrawScreen();
 
         // Start WiFi non-blocking — MCP + data fetch happens in loop()
-        Serial.printf("[WiFi] Connecting to %s\n", WIFI_SSID);
+        Serial.printf("[WiFi] Connecting to %s\n", NetCfg::ssid());
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
         delay(50);
         WiFi.mode(WIFI_STA);
-        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        WiFi.begin(NetCfg::ssid(), NetCfg::pass());
         pendingWiFiConnect = true;
         wifiConnectStart = millis();
 
@@ -1229,8 +1230,8 @@ void setup() {
         int fw = canvas.textWidth("WiFi FAILED");
         canvas.drawString("WiFi FAILED", (SCREEN_W - fw) / 2, SCREEN_H * 2 / 3);
         canvas.setFont(&fonts::Font2);
-        int cfw = canvas.textWidth("Check config.h");
-        canvas.drawString("Check config.h", (SCREEN_W - cfw) / 2, SCREEN_H * 2 / 3 + 20);
+        int cfw = canvas.textWidth("Reflash via web flasher");
+        canvas.drawString("Reflash via web flasher", (SCREEN_W - cfw) / 2, SCREEN_H * 2 / 3 + 20);
         pushDisplay();
         delay(5000);
         enterDeepSleep();

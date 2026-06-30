@@ -4,6 +4,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include "config.h"
+#include "net_cfg.h"
 #include "ui.h"
 
 // ─── MCP Streamable HTTP Client ─────────────────────────────────────────────
@@ -270,7 +271,7 @@ private:
         http.begin(_sslClient, url);
         http.addHeader("Content-Type", "application/json");
         http.addHeader("Accept", "application/json, text/event-stream");
-        http.addHeader("Authorization", String("Bearer ") + AUTH_TOKEN);
+        http.addHeader("Authorization", String("Bearer ") + NetCfg::token());
         http.setTimeout(20000);
         const char* collectHeaders[] = {"Content-Type"};
         http.collectHeaders(collectHeaders, 1);
