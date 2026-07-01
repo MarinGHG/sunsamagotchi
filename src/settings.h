@@ -11,6 +11,14 @@ enum StandbyScreen : uint8_t {
     STANDBY_OPT_COUNT
 };
 
+// OTA update channel — which manifest.json the device checks against.
+enum OtaChannel : uint8_t {
+    OTA_OFF    = 0,  // never check
+    OTA_BETA   = 1,  // preview.sunsamagotchi.pages.dev — matches firmware `beta` tier
+    OTA_STABLE = 2,  // sunsamagotchi.marinbenke.dev — matches firmware `master` tier
+    OTA_CHANNEL_COUNT
+};
+
 struct AppSettings {
     uint8_t  sleepMinutes;     // Deep sleep interval (1,5,10,15)
     uint8_t  refreshMinutes;   // Background refresh interval (1,3,5,10)
@@ -18,6 +26,8 @@ struct AppSettings {
     uint32_t activeTimeoutMs;  // Auto-sleep timeout in ms (30000,60000,120000)
     uint8_t  standbyScreen;    // Standby layout (STANDBY_DEFAULT / STANDBY_CALENDAR)
     bool     introSeen;        // First-run intro/tutorial dismissed
+    uint8_t  otaChannel;       // OtaChannel — OTA_OFF disables checks entirely
+    char     otaSkipTag[24];   // Version tag the user chose to never be notified about again
 };
 
 // Allowed values for cycling
@@ -35,6 +45,8 @@ enum SettingsItem : uint8_t {
     SETT_TIME_FMT,
     SETT_STANDBY,
     SETT_ACTIVE_TIMEOUT,
+    SETT_OTA_CHANNEL,
+    SETT_OTA_CHECK_NOW,  // action row — SELECT triggers an immediate manifest check
     SETT_COUNT
 };
 
@@ -50,6 +62,8 @@ inline void load(AppSettings& s) {
     s.activeTimeoutMs = _prefs.getULong("activeTO", 60000);
     s.standbyScreen   = _prefs.getUChar("standby", STANDBY_DEFAULT);
     s.introSeen       = _prefs.getBool("introSeen", false);
+    s.otaChannel      = _prefs.getUChar("otaChan", OTA_OFF);
+    _prefs.getString("otaSkip", s.otaSkipTag, sizeof(s.otaSkipTag));
     _prefs.end();
 }
 
@@ -61,6 +75,17 @@ inline void save(const AppSettings& s) {
     _prefs.putULong("activeTO", s.activeTimeoutMs);
     _prefs.putUChar("standby", s.standbyScreen);
     _prefs.putBool("introSeen", s.introSeen);
+    _prefs.putUChar("otaChan", s.otaChannel);
+    _prefs.putString("otaSkip", s.otaSkipTag);
+    _prefs.end();
+}
+
+// Persist just the skipped-version tag without rewriting every other key —
+// called from the OTA "never notify for this version" action.
+inline void saveOtaSkipTag(AppSettings& s, const char* tag) {
+    strlcpy(s.otaSkipTag, tag, sizeof(s.otaSkipTag));
+    _prefs.begin("pager", false);
+    _prefs.putString("otaSkip", s.otaSkipTag);
     _prefs.end();
 }
 
@@ -100,6 +125,9 @@ inline void cycleNext(AppSettings& s, SettingsItem item) {
             }
             break;
         }
+        case SETT_OTA_CHANNEL:
+            s.otaChannel = (s.otaChannel + 1) % OTA_CHANNEL_COUNT;
+            break;
         default: break;
     }
     save(s);
@@ -140,6 +168,9 @@ inline void cyclePrev(AppSettings& s, SettingsItem item) {
             }
             break;
         }
+        case SETT_OTA_CHANNEL:
+            s.otaChannel = (s.otaChannel + OTA_CHANNEL_COUNT - 1) % OTA_CHANNEL_COUNT;
+            break;
         default: break;
     }
     save(s);
@@ -168,6 +199,13 @@ inline void formatValue(char* out, size_t sz, const AppSettings& s, SettingsItem
         case SETT_ACTIVE_TIMEOUT:
             snprintf(out, sz, "%lus", (unsigned long)(s.activeTimeoutMs / 1000));
             break;
+        case SETT_OTA_CHANNEL:
+            snprintf(out, sz, "%s", s.otaChannel == OTA_STABLE ? "Stable"
+                                    : s.otaChannel == OTA_BETA  ? "Beta" : "Off");
+            break;
+        case SETT_OTA_CHECK_NOW:
+            snprintf(out, sz, "%s", "Press SELECT");
+            break;
         default:
             out[0] = '\0';
             break;
@@ -181,6 +219,8 @@ inline const char* itemLabel(SettingsItem item) {
         case SETT_TIME_FMT:      return "Time format";
         case SETT_STANDBY:       return "Standby screen";
         case SETT_ACTIVE_TIMEOUT: return "Active timeout";
+        case SETT_OTA_CHANNEL:   return "OTA updates";
+        case SETT_OTA_CHECK_NOW: return "Check for update";
         default: return "";
     }
 }
