@@ -9,6 +9,13 @@
 #include "net_cfg.h"
 #include "settings.h"
 
+// PlatformIO injects the real value via scripts/version.py (git tag/describe,
+// or the exact release tag in CI). This is only a fallback for IDEs/build
+// setups that skip extra_scripts.
+#ifndef FIRMWARE_VERSION
+#define FIRMWARE_VERSION "dev-local"
+#endif
+
 // ─── Screen IDs ─────────────────────────────────────────────────────────────
 enum Screen : uint8_t {
     SCREEN_DASHBOARD = 0,
@@ -396,24 +403,27 @@ inline void drawIntroScreen(M5Canvas& c) {
 #endif
 
 #if IS_EINK
-    // CoreInk 200x200: character centred, description + hints below
-    drawSunsamagotchiChar(c, 100, 82, 36);
+    // CoreInk 200x200: character centred, description + hints below.
+    // Everything below the dotted line must clear the footer band
+    // (SCREEN_H - FOOT_H = 178) so the "Press SELECT" footer hint never
+    // overlaps the control list — that overlap was the "jammed" intro bug.
+    drawSunsamagotchiChar(c, 100, 68, 28);
 
     c.setTextColor(CLR_TEXT);
     c.setFont(&fonts::FreeSansBold9pt7b);
     int nw = c.textWidth("Sunsamagotchi");
-    c.drawString("Sunsamagotchi", (SCREEN_W - nw) / 2, 134);
+    c.drawString("Sunsamagotchi", (SCREEN_W - nw) / 2, 104);
     c.setFont(&fonts::Font2);
     int sw = c.textWidth("Your pocket Sunsama friend!");
-    c.drawString("Your pocket Sunsama friend!", (SCREEN_W - sw) / 2, 153);
+    c.drawString("Your pocket Sunsama friend!", (SCREEN_W - sw) / 2, 122);
 
-    drawDottedLine(c, 170);
+    drawDottedLine(c, 138);
 
     c.setFont(&fonts::Font0);
     c.setTextColor(CLR_TEXT);
-    c.drawString("Dial UP/DOWN  scroll lists", 8, 175);
-    c.drawString("Dial PRESS    select / confirm", 8, 186);
-    c.drawString("Top button    next page", 8, 197);
+    c.drawString("Dial UP/DOWN  scroll lists", 8, 144);
+    c.drawString("Dial PRESS    select / confirm", 8, 155);
+    c.drawString("Top button    next page", 8, 166);
 
 #else
     // StickC 240x135: character left, text right
@@ -1473,14 +1483,17 @@ inline void drawSettingsScreen(M5Canvas& c, const AppSettings& settings,
     c.setFont(&fonts::Font0);
     c.setTextColor(CLR_TEXT_DIM);
     char info[48];
+    char fwShort[20];
+    trunc(fwShort, FIRMWARE_VERSION, sizeof(fwShort));
 #if IS_EINK
     snprintf(info, sizeof(info), "WiFi: %s  Batt: %d%%", NetCfg::ssid(), batt);
     c.drawString(info, PAD + 2, infoY);
-    c.drawString("Sunsamagotchi | M5Stack CoreInk", PAD + 2, infoY + 12);
+    snprintf(info, sizeof(info), "CoreInk | fw %s", fwShort);
+    c.drawString(info, PAD + 2, infoY + 12);
 #else
-    // StickC: limited vertical space — single compact line
-    snprintf(info, sizeof(info), "Batt: %d%%  WiFi: %s", batt,
-             WiFi.status() == WL_CONNECTED ? "OK" : "offline");
+    // StickC: limited vertical space — single compact line, version wins over
+    // WiFi status here since that's already visible via the header icon.
+    snprintf(info, sizeof(info), "Batt: %d%%  fw %s", batt, fwShort);
     c.drawString(info, PAD + 2, infoY);
 #endif
 

@@ -18,6 +18,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags, needed for changelog + version.py git describe
 
       - uses: actions/cache@v4
         with:
@@ -33,10 +35,36 @@ jobs:
       - name: Prepare config.h
         run: cp src/config.h.example src/config.h
 
+      # Derived here (not just for beta/master) so FW_VERSION is baked into
+      # every build, including dev artifacts, and both boards embed the
+      # identical string as the eventual GitHub release tag.
+      - name: Derive version tag
+        id: tag
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y%m%d)
+          if [ "${GITHUB_REF##*/}" = "beta" ]; then
+            echo "tag=beta-${DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+            echo "name=Beta ${DATE} (${SHORT_SHA})" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "dispatch_event=firmware-beta" >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_REF##*/}" = "master" ]; then
+            echo "tag=firmware-${DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+            echo "name=Firmware ${DATE} (${SHORT_SHA})" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "dispatch_event=firmware-release" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=dev-${DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build CoreInk
+        env:
+          FW_VERSION: ${{ steps.tag.outputs.tag }}
         run: pio run -e m5stack-coreink
 
       - name: Build StickC Plus2
+        env:
+          FW_VERSION: ${{ steps.tag.outputs.tag }}
         run: pio run -e m5stick-cplus2
 
       - name: Collect binaries
@@ -61,24 +89,24 @@ jobs:
           path: dist/*.bin
           retention-days: 14
 
-      # --- beta / master: derive a version tag and cut a release ---
-      - name: Derive version tag
+      # --- beta / master: build a changelog since the last tag of the same tier ---
+      - name: Build changelog
         if: github.ref == 'refs/heads/beta' || github.ref == 'refs/heads/master'
-        id: tag
+        id: changelog
         run: |
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          DATE=$(date -u +%Y%m%d)
-          if [ "${GITHUB_REF##*/}" = "beta" ]; then
-            echo "tag=beta-${DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-            echo "name=Beta ${DATE} (${SHORT_SHA})" >> "$GITHUB_OUTPUT"
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
-            echo "dispatch_event=firmware-beta" >> "$GITHUB_OUTPUT"
+          TIER="${GITHUB_REF##*/}"
+          PREV_TAG=$(git tag --list "${TIER}-*" --sort=-creatordate | head -n1)
+          if [ -n "$PREV_TAG" ]; then
+            LOG=$(git log "${PREV_TAG}..HEAD" --pretty='- %s (%h)' -- src platformio.ini)
           else
-            echo "tag=firmware-${DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-            echo "name=Firmware ${DATE} (${SHORT_SHA})" >> "$GITHUB_OUTPUT"
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
-            echo "dispatch_event=firmware-release" >> "$GITHUB_OUTPUT"
+            LOG=$(git log -n 20 --pretty='- %s (%h)' -- src platformio.ini)
           fi
+          if [ -z "$LOG" ]; then LOG="- No source changes since ${PREV_TAG:-repo start}."; fi
+          {
+            echo "log<<CHANGELOG_EOF"
+            echo "$LOG"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         if: github.ref == 'refs/heads/beta' || github.ref == 'refs/heads/master'
@@ -91,6 +119,9 @@ jobs:
             Auto-built from commit ${{ github.sha }} on `${{ github.ref_name }}`.
 
             ${{ steps.tag.outputs.prerelease == 'true' && 'Beta build — flash via the web flasher beta channel before promoting to master.' || 'Stable release — flash via the web flasher: https://sunsamagotchi.marinbenke.dev' }}
+
+            ## Changelog
+            ${{ steps.changelog.outputs.log }}
           files: dist/*.bin
           fail_on_unmatched_files: true
 
