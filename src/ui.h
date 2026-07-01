@@ -861,6 +861,244 @@ inline void drawEventsScreen(M5Canvas& c, EventItem* events, uint8_t eventCount,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ── Calendar standby screen ─────────────────────────────────────────────────
+//
+// A Sunsama-style day timeline used as an alternative deep-sleep (standby)
+// layout.  Top to bottom is the flow of time; the current moment sits on a
+// bold line in the vertical centre, with its clock time pinned in the left
+// gutter.  Only a ±3 h window (6 h total) is shown, so the day appears to
+// scroll upward as time passes.  Hour markers label the gutter; timeboxed
+// tasks and calendar events are drawn as blocks positioned and sized by their
+// start time and duration, with overlapping blocks split into side-by-side
+// columns (lanes), exactly like a real calendar.
+// ═══════════════════════════════════════════════════════════════════════════
+
+inline void drawCalendarStandby(M5Canvas& c,
+                                EventItem* events, uint8_t eventCount,
+                                TaskItem* tasks, uint8_t taskCount,
+                                const char* dateStr, const char* timeStr,
+                                bool use24h, int batt, const char* ageStr,
+                                bool timerActive, uint32_t timerElapsedSec)
+{
+    c.fillSprite(CLR_BG);
+
+    // ── Current time as minutes-of-day (centre of the window) ─────────────────
+    struct tm now_tm;
+    int nowMins = 12 * 60;
+    if (getLocalTime(&now_tm, 0)) nowMins = now_tm.tm_hour * 60 + now_tm.tm_min;
+
+    // ── Top strip: date (left), running timer + sync age + battery (right) ────
+    const int topH = IS_EINK ? 15 : 13;
+    c.setFont(&fonts::Font0);
+    c.setTextColor(CLR_TEXT);
+    c.drawString(dateStr, PAD, (topH - 8) / 2);
+
+    char rstr[28];
+    char timerStr[12] = "";
+    if (timerActive) {
+        char el[10];
+        formatElapsedMin(el, sizeof(el), timerElapsedSec);
+        snprintf(timerStr, sizeof(timerStr), "%s ", el);
+    }
+    if (ageStr && ageStr[0])
+        snprintf(rstr, sizeof(rstr), "%s%s  %d%%", timerStr, ageStr, batt);
+    else
+        snprintf(rstr, sizeof(rstr), "%s%d%%", timerStr, batt);
+    c.setTextColor(CLR_TEXT_DIM);
+    int rw = c.textWidth(rstr);
+    c.drawString(rstr, SCREEN_W - rw - PAD, (topH - 8) / 2);
+    c.setTextColor(CLR_TEXT);
+    drawDottedLine(c, topH);
+
+    // ── Timeline geometry ─────────────────────────────────────────────────────
+    const int WINDOW   = 360;                 // ±3 h → 6 h total visible
+    const int gutterW  = IS_EINK ? 40 : 38;   // room for the "HH:MM" now-chip
+    const int colX     = gutterW;             // left edge of the block columns
+    const int colW     = SCREEN_W - colX - PAD;
+    const int top      = topH + 2;
+    const int bot      = SCREEN_H - 1;
+    const int availH   = bot - top;
+    const float pxPerMin = (float)availH / (float)WINDOW;
+    const int yCenter  = top + availH / 2;
+    const int winStart = nowMins - WINDOW / 2;
+    const int winEnd   = nowMins + WINDOW / 2;
+
+    auto yOf = [&](int t) -> int {
+        int y = yCenter + (int)lroundf((t - nowMins) * pxPerMin);
+        if (y < top) y = top;
+        if (y > bot) y = bot;
+        return y;
+    };
+
+    // ── Hour gridlines + gutter labels ────────────────────────────────────────
+    c.setFont(&fonts::Font0);
+    for (int h = (winStart - 60) / 60; h <= (winEnd + 60) / 60; h++) {
+        int hm = h * 60;
+        if (hm < winStart || hm > winEnd) continue;
+        int hy = yOf(hm);
+        drawDottedLine(c, hy, colX, SCREEN_W - PAD);
+        int hh = ((h % 24) + 24) % 24;
+        char hlbl[8];
+        if (use24h) {
+            snprintf(hlbl, sizeof(hlbl), "%d:00", hh);
+        } else {
+            int h12 = hh % 12; if (h12 == 0) h12 = 12;
+            snprintf(hlbl, sizeof(hlbl), "%d%s", h12, hh < 12 ? "a" : "p");
+        }
+        c.setTextColor(CLR_TEXT_DIM);
+        int lw = c.textWidth(hlbl);
+        c.drawString(hlbl, colX - lw - 3, hy - 3);
+        c.setTextColor(CLR_TEXT);
+    }
+
+    // ── Gather visible blocks (events + timeboxed tasks) ──────────────────────
+    struct Blk { int s; int e; const char* title; bool isTask; bool done;
+                 int lane; int lanes; };
+    static Blk blk[MAX_EVENTS + MAX_TASKS];
+    int nb = 0;
+
+    auto addBlock = [&](int s, int e, const char* title, bool isTask, bool done) {
+        if (s < 0 || e <= s) return;
+        // Fold across midnight so late-night windows still catch early/late blocks.
+        if (e <= winStart && s + 1440 <= winEnd) { s += 1440; e += 1440; }
+        else if (s >= winEnd && e - 1440 >= winStart) { s -= 1440; e -= 1440; }
+        if (e <= winStart || s >= winEnd) return;          // outside window
+        if (nb >= MAX_EVENTS + MAX_TASKS) return;
+        blk[nb++] = { s, e, title, isTask, done, 0, 1 };
+    };
+
+    for (int i = 0; i < eventCount; i++) {
+        EventItem& ev = events[i];
+        if (ev.isAllDay) continue;
+        int s = apiTimeToMinutes(ev.startTime);
+        if (s < 0) continue;
+        int e = s + (ev.durationMin > 0 ? ev.durationMin : 30);
+        addBlock(s, e, ev.title, false, false);
+    }
+    for (int i = 0; i < taskCount; i++) {
+        TaskItem& tk = tasks[i];
+        if (!tk.projStart[0] || !tk.projEnd[0]) continue;
+        int s = apiTimeToMinutes(tk.projStart);
+        int e = apiTimeToMinutes(tk.projEnd);
+        if (s < 0 || e < 0) continue;
+        addBlock(s, e, tk.title, true, tk.completed);
+    }
+
+    // ── Lane assignment: split overlapping blocks into side-by-side columns ───
+    // Sort by start (insertion sort — nb is tiny).
+    for (int i = 1; i < nb; i++) {
+        Blk key = blk[i];
+        int j = i - 1;
+        while (j >= 0 && blk[j].s > key.s) { blk[j + 1] = blk[j]; j--; }
+        blk[j + 1] = key;
+    }
+    for (int i = 0; i < nb; ) {
+        int clusterEnd = blk[i].e;
+        int j = i + 1;
+        while (j < nb && blk[j].s < clusterEnd) {
+            if (blk[j].e > clusterEnd) clusterEnd = blk[j].e;
+            j++;
+        }
+        int laneEnd[8]; int nLanes = 0;
+        for (int k = i; k < j; k++) {
+            int placed = -1;
+            for (int l = 0; l < nLanes; l++) {
+                if (blk[k].s >= laneEnd[l]) { placed = l; break; }
+            }
+            if (placed < 0) { placed = nLanes; if (nLanes < 8) nLanes++; }
+            laneEnd[placed] = blk[k].e;
+            blk[k].lane = placed;
+        }
+        for (int k = i; k < j; k++) blk[k].lanes = (nLanes < 1 ? 1 : nLanes);
+        i = j;
+    }
+
+    // ── Draw blocks ───────────────────────────────────────────────────────────
+    for (int i = 0; i < nb; i++) {
+        Blk& b = blk[i];
+        int y0 = yOf(b.s);
+        int y1 = yOf(b.e);
+        int h = y1 - y0;
+        if (h < 9) h = 9;                       // keep room for one text line
+        int laneW = colW / b.lanes;
+        int bx = colX + b.lane * laneW;
+        int bw = laneW - 1;
+        if (bw < 12) bw = 12;
+
+        uint16_t barColor = b.isTask ? CLR_ACCENT2 : CLR_ACCENT;
+        // Body
+        c.fillRect(bx + 3, y0, bw - 3, h, IS_COLOR ? CLR_CARD_BG : CLR_BG);
+        c.drawRect(bx, y0, bw, h, b.done ? CLR_DIVIDER : barColor);
+        // Type marker on the left edge: events = solid bar, tasks = striped bar
+        // (the stripe distinguishes them on monochrome e-ink too).
+        if (b.isTask) {
+            for (int yy = y0 + 1; yy < y0 + h - 1; yy += 2)
+                c.drawFastHLine(bx, yy, 3, b.done ? CLR_DIVIDER : barColor);
+        } else {
+            c.fillRect(bx, y0, 3, h, barColor);
+        }
+
+        // Text — time line then title when tall enough, else title only.
+        uint16_t txtColor = b.done ? CLR_TEXT_DIM : CLR_TEXT;
+        int tx = bx + 6;
+        int tw = bw - 8;
+        if (tw < 10) { continue; }
+        // Build start-time label from minutes-of-day.
+        char ts[12];
+        {
+            int sm = ((b.s % 1440) + 1440) % 1440;
+            int sh = sm / 60, smin = sm % 60;
+            if (use24h) snprintf(ts, sizeof(ts), "%d:%02d", sh, smin);
+            else {
+                int h12 = sh % 12; if (h12 == 0) h12 = 12;
+                snprintf(ts, sizeof(ts), "%d:%02d%s", h12, smin, sh < 12 ? "a" : "p");
+            }
+        }
+        c.setTextColor(txtColor);
+        if (h >= 24) {
+            c.setFont(&fonts::Font0);
+            char tline[12]; truncPx(c, tline, ts, tw);
+            c.drawString(tline, tx, y0 + 2);
+            c.setFont(&fonts::Font2);
+            char tt[48]; truncPx(c, tt, b.title, tw);
+            c.drawString(tt, tx, y0 + 10);
+        } else {
+            c.setFont(&fonts::Font0);
+            char tt[48]; truncPx(c, tt, b.title, tw);
+            c.drawString(tt, tx, y0 + (h - 8) / 2);
+        }
+        c.setTextColor(CLR_TEXT);
+    }
+
+    if (nb == 0) {
+        c.setFont(&fonts::Font2);
+        c.setTextColor(CLR_TEXT_DIM);
+        const char* msg = "No events or tasks";
+        int mw = c.textWidth(msg);
+        c.drawString(msg, colX + (colW - mw) / 2, top + 6);
+        c.setTextColor(CLR_TEXT);
+    }
+
+    // ── "Now" line (drawn last so it sits on top of blocks) ───────────────────
+    c.drawFastHLine(colX, yCenter, SCREEN_W - colX - PAD, CLR_ACCENT);
+    if (IS_EINK) c.drawFastHLine(colX, yCenter + 1, SCREEN_W - colX - PAD, CLR_ACCENT);
+    c.fillCircle(colX, yCenter, 2, CLR_ACCENT);
+
+    // Current time pinned in the gutter on an accent chip for emphasis.  The
+    // chip may overhang the first column slightly — it sits on top, like the
+    // current-time pill in Sunsama.
+    c.setFont(&fonts::Font2);
+    int ctw = c.textWidth(timeStr);
+    int chipH = 16;
+    int chipY = yCenter - chipH / 2;
+    int chipW = ctw + 6;
+    c.fillRect(0, chipY, chipW, chipH, CLR_ACCENT);
+    c.setTextColor(IS_COLOR ? TFT_WHITE : CLR_BG);
+    c.drawString(timeStr, 3, chipY);
+    c.setTextColor(CLR_TEXT);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // ── Timer screen ────────────────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1189,7 +1427,13 @@ inline void drawSettingsScreen(M5Canvas& c, const AppSettings& settings,
     drawHeader(c, "SETTINGS", ICON_GEAR);
 
     int yOff = BODY_TOP + 2;
-    int rowH = IS_EINK ? 22 : 20;
+    // Adaptive row height so every item + the info block fits above the footer,
+    // even as SETT_COUNT grows.  Capped at the comfortable default.
+    int infoH = IS_EINK ? 30 : 14;
+    int rowH  = (BODY_BOT - yOff - infoH) / SETT_COUNT;
+    int rowCap = IS_EINK ? 22 : 20;
+    if (rowH > rowCap) rowH = rowCap;
+    if (rowH < 14) rowH = 14;
 
     for (uint8_t i = 0; i < SETT_COUNT; i++) {
         int iy = yOff + i * rowH;
