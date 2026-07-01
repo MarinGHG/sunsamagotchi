@@ -1476,7 +1476,9 @@ inline void drawSettingsScreen(M5Canvas& c, const AppSettings& settings,
         }
 
         c.setFont(&fonts::Font2);
-        c.drawString(Settings::itemLabel((SettingsItem)i), PAD + 4, iy + (rowH - 16) / 2);
+        const char* label = Settings::itemLabel((SettingsItem)i);
+        int labelW = c.textWidth(label);
+        c.drawString(label, PAD + 4, iy + (rowH - 16) / 2);
 
         char val[16];
         Settings::formatValue(val, sizeof(val), settings, (SettingsItem)i);
@@ -1487,9 +1489,20 @@ inline void drawSettingsScreen(M5Canvas& c, const AppSettings& settings,
             char editVal[20];
             snprintf(editVal, sizeof(editVal), "< %s >", val);
             vw = c.textWidth(editVal);
-            c.drawString(editVal, SCREEN_W - vw - PAD - 2, iy + (rowH - 16) / 2);
-        } else {
-            c.drawString(val, SCREEN_W - vw - PAD - 2, iy + (rowH - 16) / 2);
+        }
+
+        // Long label + value can collide (e.g. "Check for update" / "Press
+        // SELECT" both at Font2 width overrun 200px CoreInk screens) — only
+        // draw the value if it fits clear of the label instead of overlapping.
+        int valX = SCREEN_W - vw - PAD - 2;
+        if (valX > PAD + 4 + labelW + 4) {
+            if (sel && editMode) {
+                char editVal[20];
+                snprintf(editVal, sizeof(editVal), "< %s >", val);
+                c.drawString(editVal, valX, iy + (rowH - 16) / 2);
+            } else {
+                c.drawString(val, valX, iy + (rowH - 16) / 2);
+            }
         }
 
         c.setTextColor(CLR_TEXT);
