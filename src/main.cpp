@@ -14,7 +14,7 @@
 #include "mcp_client.h"
 
 // ─── RTC-retained state (survives deep sleep) ───────────────────────────────
-#define RTC_MAGIC 0xCAFE1238  // bump when RTC_DATA_ATTR layout changes
+#define RTC_MAGIC 0xCAFE1239  // bump when RTC_DATA_ATTR layout changes
 
 RTC_DATA_ATTR uint32_t  rtcMagic = 0;
 RTC_DATA_ATTR Screen    rtcScreen = SCREEN_DASHBOARD;
@@ -30,6 +30,7 @@ RTC_DATA_ATTR TimerInfo rtcTimer;
 RTC_DATA_ATTR PlanSummary rtcPlan;
 RTC_DATA_ATTR bool      rtcDataValid = false;
 RTC_DATA_ATTR time_t    rtcLastDataFetch = 0;  // unix ts of last WiFi data fetch
+RTC_DATA_ATTR bool      rtcSunsamaFailed = false;  // true when WiFi is up but Sunsama API call failed
 // Timer sync anchor — allows elapsed time to track wall-clock through deep sleep
 RTC_DATA_ATTR uint8_t   rtcEventScrollOff = 0;
 RTC_DATA_ATTR uint8_t   rtcTimerScrollOff = 0;
@@ -421,10 +422,12 @@ void commitAsyncFetch() {
         }
         dataLoaded = true;
         time(&rtcLastDataFetch);
+        rtcSunsamaFailed = false;
         saveStateToRTC();
         Serial.println("[Data] Live state updated");
     } else {
-        Serial.println("[Data] Fetch failed, keeping previous data");
+        rtcSunsamaFailed = true;
+        Serial.println("[Data] Fetch failed (Sunsama API), keeping previous data");
     }
     fetchInProgress = false;
     lastRefresh     = millis();
@@ -455,7 +458,7 @@ void redrawScreen() {
             UI::drawDashboard(canvas, currentTime, batt,
                               tasks, taskCount, events, eventCount,
                               planSummary, timerInfo, currentDate,
-                              appSettings.use24h);
+                              appSettings.use24h, rtcSunsamaFailed);
             break;
         case SCREEN_TASKS:
             UI::drawTasksScreen(canvas, tasks, taskCount,
@@ -1182,11 +1185,15 @@ void setup() {
                     rtcTimerElapsedAtFetch = 0;
                 }
                 dataLoaded = ok;
+                rtcSunsamaFailed = !ok;
                 if (ok) {
                     time(&rtcLastDataFetch);
                     saveStateToRTC();
                 }
-                if (!ok) Serial.println("[Data] Some fetches failed");
+                if (!ok) Serial.println("[Data] Some fetches failed (Sunsama API)");
+            } else {
+                rtcSunsamaFailed = true;
+                Serial.println("[Data] mcp.begin() failed (Sunsama API unreachable)");
             }
         }
         enterDeepSleep();
@@ -1252,16 +1259,21 @@ void setup() {
     pushDisplay();
 
     if (!mcp.begin()) {
+        rtcSunsamaFailed = true;
         canvas.fillSprite(CLR_BG);
         canvas.setFont(&fonts::FreeSansBold9pt7b);
         canvas.setTextColor(CLR_TEXT);
-        int mfw = canvas.textWidth("MCP Failed");
-        canvas.drawString("MCP Failed", (SCREEN_W - mfw) / 2, SCREEN_H / 2 - 8);
+        int mfw = canvas.textWidth("Sunsama FAILED");
+        canvas.drawString("Sunsama FAILED", (SCREEN_W - mfw) / 2, SCREEN_H / 2 - 8);
+        canvas.setFont(&fonts::Font2);
+        int cfw = canvas.textWidth("Check bearer token / reflash");
+        canvas.drawString("Check bearer token / reflash", (SCREEN_W - cfw) / 2, SCREEN_H / 2 + 14);
         pushDisplay();
         delay(5000);
         enterDeepSleep();
         return;
     }
+    rtcSunsamaFailed = false;
     mcpReady = true;
 
     fetchAllData();
