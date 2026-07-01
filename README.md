@@ -28,9 +28,21 @@ Under the hood, it's a custom MCP client talking to Sunsama's MCP server over St
 | Events | Calendar events with time and duration |
 | Timer | Start/stop task timer, synced with web/mobile |
 | Stats | Tasks completed, elapsed time, battery, WiFi |
-| Settings | Sleep interval, refresh interval, 12/24h, active timeout |
+| Settings | Sleep interval, refresh interval, 12/24h, standby screen, active timeout |
 
 Settings persist across reboots via NVS.
+
+### Standby screen
+
+While the device is asleep it shows a standby screen, refreshed once a minute.
+Two layouts are available (Settings → Standby screen):
+
+- **Clock** (default) — large clock, date, task progress and the next task.
+- **Calendar** — a Sunsama-style day timeline. Time flows top to bottom with
+  the current moment on a bold line in the centre (its time pinned in the left
+  gutter alongside hour markers), showing a ±3 h window that scrolls as the day
+  progresses. Timeboxed tasks and calendar events appear as blocks with their
+  name and time; overlapping items split into side-by-side columns.
 
 ## Button Controls
 

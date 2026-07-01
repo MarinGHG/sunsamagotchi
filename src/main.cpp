@@ -891,6 +891,13 @@ void enterDeepSleep() {
     uint8_t doneCnt = 0;
     for (uint8_t i = 0; i < taskCount; i++) if (tasks[i].completed) doneCnt++;
 
+    if (appSettings.standbyScreen == STANDBY_CALENDAR) {
+        // ── Sunsama-style day timeline standby (both boards) ──────────────────
+        UI::drawCalendarStandby(canvas, events, eventCount, tasks, taskCount,
+                                currentDate, currentTime, appSettings.use24h,
+                                batt, ageStr, timerInfo.active, timerInfo.elapsedSec);
+    } else {
+
 #if IS_EINK
     // ── CoreInk 200x200 standby screen ────────────────────────────────────────
     canvas.setTextColor(CLR_TEXT);
@@ -1078,6 +1085,8 @@ void enterDeepSleep() {
     int rbw = canvas.textWidth(refBuf);
     canvas.drawString(refBuf, SCREEN_W - rbw - 4, SCREEN_H - 12);
 #endif
+
+    }  // end standby-layout selection
 
     pushDisplay();
 
