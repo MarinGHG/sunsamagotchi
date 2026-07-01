@@ -173,7 +173,7 @@ inline void formatApiTime(char* out, size_t outSz, const char* apiTime, bool use
 
 // ── Decorative elements ─────────────────────────────────────────────────────
 
-inline void drawHeader(M5Canvas& c, const char* title, const uint8_t* icon = nullptr) {
+inline void drawHeader(M5Canvas& c, const char* title, const uint8_t* icon = nullptr, bool sunsamaFailed = false) {
     c.fillRect(0, 0, SCREEN_W, HDR_H, CLR_HEADER_BG);
     c.setTextColor(CLR_HEADER_TEXT);
     c.setFont(&fonts::Font2);
@@ -183,6 +183,13 @@ inline void drawHeader(M5Canvas& c, const char* title, const uint8_t* icon = nul
         c.drawString(title, 16, textY);
     } else {
         c.drawString(title, 5, textY);
+    }
+    // WiFi is up but the last Sunsama API call failed — distinct from a WiFi outage.
+    if (sunsamaFailed) {
+        int bx = SCREEN_W - 44, by = (HDR_H - 10) / 2;
+        c.fillRect(bx, by, 16, 10, CLR_HEADER_BG);
+        c.drawRect(bx, by, 16, 10, CLR_HEADER_TEXT);
+        c.drawString("!", bx + 5, by - 1);
     }
 }
 
@@ -443,10 +450,11 @@ inline void drawDashboard(M5Canvas& c, const char* timeStr, int batt,
                           TaskItem* tasks, uint8_t taskCount,
                           EventItem* events, uint8_t eventCount,
                           PlanSummary& plan, TimerInfo& timer,
-                          const char* dateStr, bool use24h)
+                          const char* dateStr, bool use24h,
+                          bool sunsamaFailed = false)
 {
     c.fillSprite(CLR_BG);
-    drawHeader(c, "SUNSAMAGOTCHI");
+    drawHeader(c, "SUNSAMAGOTCHI", nullptr, sunsamaFailed);
     drawBattery(c, batt);
 
 #if IS_EINK
