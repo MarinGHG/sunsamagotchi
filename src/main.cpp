@@ -24,6 +24,7 @@ RTC_DATA_ATTR uint8_t   rtcTaskScrollOff = 0;
 RTC_DATA_ATTR uint8_t   rtcTaskSelIdx = 0;
 RTC_DATA_ATTR uint8_t   rtcTimerSelIdx = 0;
 RTC_DATA_ATTR uint8_t   rtcSettSelIdx = 0;
+RTC_DATA_ATTR uint8_t   rtcSettScrollOff = 0;
 RTC_DATA_ATTR TaskItem  rtcTasks[MAX_TASKS];
 RTC_DATA_ATTR uint8_t   rtcTaskCount = 0;
 RTC_DATA_ATTR EventItem rtcEvents[MAX_EVENTS];
@@ -75,6 +76,7 @@ static uint8_t    timerSelIdx     = 0;
 static uint8_t    timerScrollOff  = 0;
 static uint8_t    eventScrollOff  = 0;
 static uint8_t    settSelIdx      = 0;
+static uint8_t    settScrollOff   = 0;
 
 static TaskItem   tasks[MAX_TASKS];
 static uint8_t    taskCount = 0;
@@ -345,31 +347,20 @@ void otaMaybeCheck() {
 // the user is explicitly asking right now. Blocking (device is awake with
 // the user watching anyway); connects WiFi itself if not already up.
 void otaCheckNowInteractive() {
-    canvas.fillSprite(CLR_BG);
-    UI::drawHeader(canvas, "SUNSAMAGOTCHI");
-    canvas.setFont(&fonts::FreeSansBold9pt7b);
-    canvas.setTextColor(CLR_TEXT);
-    const char* msg = (appSettings.otaChannel == OTA_OFF)
-                     ? "OTA is turned off" : "Checking for update...";
-    int w = canvas.textWidth(msg);
-    canvas.drawString(msg, (SCREEN_W - w) / 2, SCREEN_H / 2 - 8);
     if (appSettings.otaChannel == OTA_OFF) {
-        canvas.setFont(&fonts::Font2);
-        const char* sub = "Enable a channel above first";
-        int sw = canvas.textWidth(sub);
-        canvas.drawString(sub, (SCREEN_W - sw) / 2, SCREEN_H / 2 + 14);
+        UI::drawOtaStatus(canvas, "OTA is turned off", "Enable a channel above first");
+        pushDisplay();
+        delay(2000);
+        needsRedraw = true;
+        return;
     }
+
+    UI::drawOtaStatus(canvas, "Checking for update", "This can take a few seconds");
     pushDisplay();
-    if (appSettings.otaChannel == OTA_OFF) { delay(2000); needsRedraw = true; return; }
 
     bool wasConnected = (WiFi.status() == WL_CONNECTED);
     if (!wasConnected && !connectWiFi()) {
-        canvas.fillSprite(CLR_BG);
-        UI::drawHeader(canvas, "SUNSAMAGOTCHI");
-        canvas.setFont(&fonts::FreeSansBold9pt7b);
-        canvas.setTextColor(CLR_TEXT);
-        int fw = canvas.textWidth("WiFi unavailable");
-        canvas.drawString("WiFi unavailable", (SCREEN_W - fw) / 2, SCREEN_H / 2 - 8);
+        UI::drawOtaStatus(canvas, "WiFi unavailable", "Check network and try again");
         pushDisplay();
         delay(2000);
         needsRedraw = true;
@@ -379,10 +370,6 @@ void otaCheckNowInteractive() {
     Ota::CheckResult res;
     bool available = Ota::check(appSettings.otaChannel, res);
 
-    canvas.fillSprite(CLR_BG);
-    UI::drawHeader(canvas, "SUNSAMAGOTCHI");
-    canvas.setFont(&fonts::FreeSansBold9pt7b);
-    canvas.setTextColor(CLR_TEXT);
     if (available) {
         rtcOtaAvailable = true;
         strlcpy(rtcOtaTag, res.tag, sizeof(rtcOtaTag));
@@ -392,9 +379,8 @@ void otaCheckNowInteractive() {
         needsRedraw = true;
         return;  // let redrawScreen() render the OTA prompt overlay
     } else {
-        char msg2[32]; snprintf(msg2, sizeof(msg2), "Up to date (%s)", FIRMWARE_VERSION);
-        int w2 = canvas.textWidth(msg2);
-        canvas.drawString(msg2, (SCREEN_W - w2) / 2, SCREEN_H / 2 - 8);
+        char sub[32]; snprintf(sub, sizeof(sub), "Running %s", FIRMWARE_VERSION);
+        UI::drawOtaStatus(canvas, "Up to date", sub);
         pushDisplay();
         delay(2000);
         needsRedraw = true;
@@ -402,14 +388,14 @@ void otaCheckNowInteractive() {
 }
 
 // Progress callback for Ota::performUpdate — must be a plain function
-// pointer (non-capturing), so canvas/lastPct are file-scope statics instead
-// of a lambda capture. Only redraws on actual percent change to limit
-// e-ink refresh wear during the ~10-20s download.
+// pointer (non-capturing), so lastPct is a file-scope static instead of a
+// lambda capture. Only redraws on actual percent change to limit e-ink
+// refresh wear during the ~10-20s download.
 static int otaLastDrawnPct = -1;
 void otaProgressCallback(int pct) {
     if (pct == otaLastDrawnPct) return;
     otaLastDrawnPct = pct;
-    UI::drawOtaProgress(canvas, pct);
+    UI::drawOtaStatus(canvas, "Installing update", nullptr, pct);
     pushDisplay();
 }
 
@@ -420,7 +406,7 @@ void otaProgressCallback(int pct) {
 // device — see the rollback check at the top of setup().
 void otaInstallNow() {
     otaLastDrawnPct = -1;
-    UI::drawOtaProgress(canvas, 0);
+    UI::drawOtaStatus(canvas, "Installing update", nullptr, 0);
     pushDisplay();
 
     bool ok = Ota::performUpdate(otaAvailableUrl, otaProgressCallback);
@@ -432,15 +418,7 @@ void otaInstallNow() {
         delay(200);
         ESP.restart();
     } else {
-        canvas.fillSprite(CLR_BG);
-        UI::drawHeader(canvas, "SUNSAMAGOTCHI");
-        canvas.setFont(&fonts::FreeSansBold9pt7b);
-        canvas.setTextColor(CLR_TEXT);
-        int fw = canvas.textWidth("Update failed");
-        canvas.drawString("Update failed", (SCREEN_W - fw) / 2, SCREEN_H / 2 - 8);
-        canvas.setFont(&fonts::Font2);
-        int cw = canvas.textWidth("Old firmware unaffected");
-        canvas.drawString("Old firmware unaffected", (SCREEN_W - cw) / 2, SCREEN_H / 2 + 14);
+        UI::drawOtaStatus(canvas, "Update failed", "Old firmware unaffected");
         pushDisplay();
         delay(3000);
         needsRedraw = true;
@@ -482,6 +460,7 @@ void saveStateToRTC() {
     rtcTimerScrollOff = timerScrollOff;
     rtcEventScrollOff = eventScrollOff;
     rtcSettSelIdx = settSelIdx;
+    rtcSettScrollOff = settScrollOff;
     memcpy(rtcTasks, tasks, sizeof(tasks));
     rtcTaskCount = taskCount;
     memcpy(rtcEvents, events, sizeof(events));
@@ -500,6 +479,7 @@ bool restoreStateFromRTC() {
     timerScrollOff = rtcTimerScrollOff;
     eventScrollOff = rtcEventScrollOff;
     settSelIdx = rtcSettSelIdx;
+    settScrollOff = rtcSettScrollOff;
     memcpy(tasks, rtcTasks, sizeof(tasks));
     taskCount = rtcTaskCount;
     memcpy(events, rtcEvents, sizeof(events));
@@ -643,7 +623,7 @@ void redrawScreen() {
             UI::drawStatsScreen(canvas, tasks, taskCount, timerInfo, batt);
             break;
         case SCREEN_SETTINGS:
-            UI::drawSettingsScreen(canvas, appSettings, settSelIdx, batt, settingsEditMode);
+            UI::drawSettingsScreen(canvas, appSettings, settSelIdx, batt, settingsEditMode, settScrollOff);
             break;
         default: break;
     }
@@ -684,6 +664,26 @@ void scrollTaskSelectionUp() {
         } else if (taskSelectedIdx - taskScrollOff >= (uint8_t)maxVis) {
             taskScrollOff = taskSelectedIdx - maxVis + 1;
         }
+    }
+}
+
+// Settings row height/reserved-footer must match UI::drawSettingsScreen exactly
+// or the selection can scroll to a row the draw call doesn't render.
+static int settingsMaxVis() {
+    int yOff = UI::BODY_TOP + 2;
+    int infoH = IS_EINK ? 30 : 14;
+    int rowH  = IS_EINK ? 22 : 20;
+    int maxVis = (UI::BODY_BOT - yOff - infoH) / rowH;
+    return maxVis < 1 ? 1 : maxVis;
+}
+
+void scrollSettingsSelection(int dir) {
+    int maxVis = settingsMaxVis();
+    settSelIdx = (uint8_t)((settSelIdx + SETT_COUNT + dir) % SETT_COUNT);
+    if (settSelIdx < settScrollOff) {
+        settScrollOff = settSelIdx;
+    } else if (settSelIdx - settScrollOff >= (uint8_t)maxVis) {
+        settScrollOff = settSelIdx - maxVis + 1;
     }
 }
 
@@ -957,7 +957,7 @@ void handleButtons() {
                     break;
                 case SCREEN_SETTINGS:
                     if (settingsEditMode) Settings::cyclePrev(appSettings, (SettingsItem)settSelIdx);
-                    else settSelIdx = (settSelIdx + SETT_COUNT - 1) % SETT_COUNT;
+                    else scrollSettingsSelection(-1);
                     break;
                 default: break;
             }
@@ -987,7 +987,7 @@ void handleButtons() {
                     break;
                 case SCREEN_SETTINGS:
                     if (settingsEditMode) Settings::cycleNext(appSettings, (SettingsItem)settSelIdx);
-                    else settSelIdx = (settSelIdx + 1) % SETT_COUNT;
+                    else scrollSettingsSelection(1);
                     break;
                 default: break;
             }

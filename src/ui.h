@@ -1449,22 +1449,23 @@ inline void drawStatsScreen(M5Canvas& c, TaskItem* tasks, uint8_t taskCount,
 // ═══════════════════════════════════════════════════════════════════════════
 
 inline void drawSettingsScreen(M5Canvas& c, const AppSettings& settings,
-                                uint8_t selIdx, int batt, bool editMode)
+                                uint8_t selIdx, int batt, bool editMode,
+                                uint8_t scrollOff = 0)
 {
     c.fillSprite(CLR_BG);
     drawHeader(c, "SETTINGS", ICON_GEAR);
 
     int yOff = BODY_TOP + 2;
-    // Adaptive row height so every item + the info block fits above the footer,
-    // even as SETT_COUNT grows.  Capped at the comfortable default.
+    // Fixed, comfortable row height — the list scrolls (like Tasks/Events)
+    // instead of rows shrinking indefinitely as SETT_COUNT grows.
     int infoH = IS_EINK ? 30 : 14;
-    int rowH  = (BODY_BOT - yOff - infoH) / SETT_COUNT;
-    int rowCap = IS_EINK ? 22 : 20;
-    if (rowH > rowCap) rowH = rowCap;
-    if (rowH < 14) rowH = 14;
+    int rowH  = IS_EINK ? 22 : 20;
+    int maxVis = (BODY_BOT - yOff - infoH) / rowH;
+    if (maxVis < 1) maxVis = 1;
 
-    for (uint8_t i = 0; i < SETT_COUNT; i++) {
-        int iy = yOff + i * rowH;
+    for (uint8_t vi = 0; vi < maxVis && (scrollOff + vi) < SETT_COUNT; vi++) {
+        uint8_t i = scrollOff + vi;
+        int iy = yOff + vi * rowH;
         bool sel = (i == selIdx);
 
         if (sel) {
@@ -1494,8 +1495,17 @@ inline void drawSettingsScreen(M5Canvas& c, const AppSettings& settings,
         c.setTextColor(CLR_TEXT);
     }
 
+    // Scroll indicators — same triangle style as Tasks/Events
+    if (scrollOff > 0) {
+        c.fillTriangle(SCREEN_W - 10, yOff - 1, SCREEN_W - 14, yOff + 3, SCREEN_W - 6, yOff + 3, CLR_TEXT);
+    }
+    if (scrollOff + maxVis < SETT_COUNT) {
+        int by = yOff + maxVis * rowH - 5;
+        c.fillTriangle(SCREEN_W - 10, by + 4, SCREEN_W - 14, by, SCREEN_W - 6, by, CLR_TEXT);
+    }
+
     // Device info below settings
-    int infoY = yOff + SETT_COUNT * rowH + 4;
+    int infoY = yOff + maxVis * rowH + 4;
     drawDottedLine(c, infoY);
     infoY += 4;
     c.setFont(&fonts::Font0);
@@ -1612,31 +1622,58 @@ inline void drawOtaPrompt(M5Canvas& c, const char* tag, uint8_t sel) {
     c.drawString(hint, (SCREEN_W - hw) / 2, by + bh - 12);
 }
 
-// ── OTA flash progress (blocking screen, shown only during active install) ──
-inline void drawOtaProgress(M5Canvas& c, int pct) {
+// ── OTA status screen — used for every blocking OTA phase (checking,
+// downloading/flashing, success, failure) so text width/padding is handled
+// in exactly one place instead of ad-hoc canvas calls scattered per call
+// site. pct < 0 means "no determinate progress" (e.g. the manifest check,
+// which is a single quick request with nothing to report a percentage on):
+// draws a plain indeterminate "working" bar instead of a percentage fill.
+inline void drawOtaStatus(M5Canvas& c, const char* title, const char* subtitle = nullptr, int pct = -1) {
     c.fillSprite(CLR_BG);
+
     c.setFont(&fonts::FreeSansBold9pt7b);
     c.setTextColor(CLR_TEXT);
-    const char* title = "Installing update...";
-    int tw = c.textWidth(title);
-    c.drawString(title, (SCREEN_W - tw) / 2, SCREEN_H / 2 - 22);
+    char t[28]; truncPx(c, t, title, SCREEN_W - 2 * PAD - 8);
+    int tw = c.textWidth(t);
+    int titleY = SCREEN_H / 2 - 30;
+    c.drawString(t, (SCREEN_W - tw) / 2, titleY);
+
+    if (subtitle) {
+        c.setFont(&fonts::Font2);
+        c.setTextColor(CLR_TEXT_DIM);
+        char s[36]; truncPx(c, s, subtitle, SCREEN_W - 2 * PAD - 8);
+        int sw = c.textWidth(s);
+        c.drawString(s, (SCREEN_W - sw) / 2, titleY + 20);
+        c.setTextColor(CLR_TEXT);
+    }
 
     int barW = SCREEN_W - 40, barH = 14;
-    int barX = 20, barY = SCREEN_H / 2;
+    int barX = 20, barY = SCREEN_H / 2 + 6;
     c.drawRect(barX, barY, barW, barH, CLR_TEXT);
-    int fillW = (barW - 4) * pct / 100;
-    if (fillW > 0) c.fillRect(barX + 2, barY + 2, fillW, barH - 4, CLR_TEXT);
 
-    c.setFont(&fonts::Font2);
-    char pctStr[8]; snprintf(pctStr, sizeof(pctStr), "%d%%", pct);
-    int pw = c.textWidth(pctStr);
-    c.drawString(pctStr, (SCREEN_W - pw) / 2, barY + barH + 8);
+    if (pct >= 0) {
+        int fillW = (barW - 4) * pct / 100;
+        if (fillW > 0) c.fillRect(barX + 2, barY + 2, fillW, barH - 4, CLR_TEXT);
+        c.setFont(&fonts::Font2);
+        char pctStr[8]; snprintf(pctStr, sizeof(pctStr), "%d%%", pct);
+        int pw = c.textWidth(pctStr);
+        c.drawString(pctStr, (SCREEN_W - pw) / 2, barY + barH + 8);
+    } else {
+        // Indeterminate: three evenly-spaced dashes signal "working" without
+        // claiming a fake percentage for a request that has no progress to report.
+        int segW = (barW - 8) / 3;
+        for (int i = 0; i < 3; i++) {
+            c.fillRect(barX + 3 + i * segW, barY + 3, segW - 4, barH - 6, CLR_TEXT_DIM);
+        }
+    }
 
     c.setFont(&fonts::Font0);
     c.setTextColor(CLR_TEXT_DIM);
-    const char* warn = "Do not power off";
-    int ww = c.textWidth(warn);
-    c.drawString(warn, (SCREEN_W - ww) / 2, SCREEN_H - 16);
+    const char* warn = (pct >= 0) ? "Do not power off" : "";
+    if (warn[0]) {
+        int ww = c.textWidth(warn);
+        c.drawString(warn, (SCREEN_W - ww) / 2, SCREEN_H - 16);
+    }
 }
 
 // ── Completion animation ────────────────────────────────────────────────────
