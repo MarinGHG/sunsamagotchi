@@ -6,12 +6,14 @@
 #include <time.h>
 #include <sys/time.h>
 #include <esp_sleep.h>
+#include <esp_ota_ops.h>
 #include "config.h"
 #include "net_cfg.h"
 #include "hal.h"
 #include "settings.h"
 #include "ui.h"
 #include "mcp_client.h"
+#include "ota.h"
 
 // ─── RTC-retained state (survives deep sleep) ───────────────────────────────
 #define RTC_MAGIC 0xCAFE1239  // bump when RTC_DATA_ATTR layout changes
@@ -44,6 +46,18 @@ RTC_DATA_ATTR uint16_t  rtcWakeCounter = 0;
 // (battery jumps up).  ETA = remaining% / drain-rate.
 RTC_DATA_ATTR int8_t    rtcBattRefPct = -1;
 RTC_DATA_ATTR time_t    rtcBattRefTs  = 0;
+// ── OTA state ────────────────────────────────────────────────────────────
+RTC_DATA_ATTR bool      rtcOtaAvailable  = false;   // an update is waiting for a user decision
+RTC_DATA_ATTR char      rtcOtaTag[32]    = {0};      // version tag currently on offer
+RTC_DATA_ATTR int32_t   rtcOtaLastCheckDay = -1;     // days-since-epoch of last manifest check (throttle: 1/day)
+RTC_DATA_ATTR time_t    rtcOtaRemindAt   = 0;        // "remind me tomorrow" cooldown, unix ts
+// Brick-resistance: set right before rebooting into a freshly-flashed image,
+// cleared once the new image proves it can boot. If it's still set after
+// MAX_OTA_BOOT_ATTEMPTS cold boots in a row, we auto-rollback to the
+// previous OTA partition — see the top of setup().
+RTC_DATA_ATTR bool      rtcOtaValidatePending = false;
+RTC_DATA_ATTR uint8_t   rtcOtaFailedBoots     = 0;
+#define MAX_OTA_BOOT_ATTEMPTS 3
 // When a timer is active we already track elapsed locally and don't need the
 // API for the second-by-second value — we only need to occasionally check if
 // the timer was stopped on another device.  This is the floor (in minutes)
@@ -85,6 +99,8 @@ static bool       settingsEditMode = false;
 
 // Confirmation dialog state
 static ConfirmState confirmState = CONFIRM_NONE;
+static uint8_t       otaPromptSel = OTA_OPT_INSTALL;
+static char           otaAvailableUrl[192] = {0};  // set alongside rtcOtaAvailable/rtcOtaTag
 
 // Deferred WiFi connection (non-blocking wake)
 static bool       pendingWiFiConnect = false;
@@ -293,6 +309,146 @@ static uint8_t effectiveRefreshMinutes() {
     return base;
 }
 
+// ─── OTA ────────────────────────────────────────────────────────────────────
+// Piggybacks on the WiFi connection that's already open for the periodic
+// Sunsama API refresh — never opens a radio session just to check firmware,
+// so this costs ~nothing extra on top of a cycle that happens anyway.
+// Throttled to once per calendar day regardless of how often the API
+// refresh itself runs.
+void otaMaybeCheck() {
+    if (appSettings.otaChannel == OTA_OFF) return;
+
+    time_t nowTs; time(&nowTs);
+    if (nowTs < 1600000000) return;  // clock not synced yet
+    int32_t today = (int32_t)(nowTs / 86400);
+    if (rtcOtaLastCheckDay == today) return;   // already checked today
+    rtcOtaLastCheckDay = today;
+
+    if (rtcOtaRemindAt > nowTs) return;  // user asked to be reminded later, not yet due
+
+    Ota::CheckResult res;
+    if (!Ota::check(appSettings.otaChannel, res)) return;
+
+    if (strcmp(res.tag, appSettings.otaSkipTag) == 0) {
+        Serial.printf("[OTA] %s was permanently skipped — not notifying\n", res.tag);
+        return;
+    }
+
+    rtcOtaAvailable = true;
+    strlcpy(rtcOtaTag, res.tag, sizeof(rtcOtaTag));
+    strlcpy(otaAvailableUrl, res.url, sizeof(otaAvailableUrl));
+    needsRedraw = true;
+}
+
+// Settings screen "Check for update" row — SELECT here bypasses the once-a-
+// day throttle, the skip-tag, and any remind-later cooldown entirely, since
+// the user is explicitly asking right now. Blocking (device is awake with
+// the user watching anyway); connects WiFi itself if not already up.
+void otaCheckNowInteractive() {
+    canvas.fillSprite(CLR_BG);
+    UI::drawHeader(canvas, "SUNSAMAGOTCHI");
+    canvas.setFont(&fonts::FreeSansBold9pt7b);
+    canvas.setTextColor(CLR_TEXT);
+    const char* msg = (appSettings.otaChannel == OTA_OFF)
+                     ? "OTA is turned off" : "Checking for update...";
+    int w = canvas.textWidth(msg);
+    canvas.drawString(msg, (SCREEN_W - w) / 2, SCREEN_H / 2 - 8);
+    if (appSettings.otaChannel == OTA_OFF) {
+        canvas.setFont(&fonts::Font2);
+        const char* sub = "Enable a channel above first";
+        int sw = canvas.textWidth(sub);
+        canvas.drawString(sub, (SCREEN_W - sw) / 2, SCREEN_H / 2 + 14);
+    }
+    pushDisplay();
+    if (appSettings.otaChannel == OTA_OFF) { delay(2000); needsRedraw = true; return; }
+
+    bool wasConnected = (WiFi.status() == WL_CONNECTED);
+    if (!wasConnected && !connectWiFi()) {
+        canvas.fillSprite(CLR_BG);
+        UI::drawHeader(canvas, "SUNSAMAGOTCHI");
+        canvas.setFont(&fonts::FreeSansBold9pt7b);
+        canvas.setTextColor(CLR_TEXT);
+        int fw = canvas.textWidth("WiFi unavailable");
+        canvas.drawString("WiFi unavailable", (SCREEN_W - fw) / 2, SCREEN_H / 2 - 8);
+        pushDisplay();
+        delay(2000);
+        needsRedraw = true;
+        return;
+    }
+
+    Ota::CheckResult res;
+    bool available = Ota::check(appSettings.otaChannel, res);
+
+    canvas.fillSprite(CLR_BG);
+    UI::drawHeader(canvas, "SUNSAMAGOTCHI");
+    canvas.setFont(&fonts::FreeSansBold9pt7b);
+    canvas.setTextColor(CLR_TEXT);
+    if (available) {
+        rtcOtaAvailable = true;
+        strlcpy(rtcOtaTag, res.tag, sizeof(rtcOtaTag));
+        strlcpy(otaAvailableUrl, res.url, sizeof(otaAvailableUrl));
+        confirmState = CONFIRM_OTA_UPDATE;
+        otaPromptSel = OTA_OPT_INSTALL;
+        needsRedraw = true;
+        return;  // let redrawScreen() render the OTA prompt overlay
+    } else {
+        char msg2[32]; snprintf(msg2, sizeof(msg2), "Up to date (%s)", FIRMWARE_VERSION);
+        int w2 = canvas.textWidth(msg2);
+        canvas.drawString(msg2, (SCREEN_W - w2) / 2, SCREEN_H / 2 - 8);
+        pushDisplay();
+        delay(2000);
+        needsRedraw = true;
+    }
+}
+
+// Progress callback for Ota::performUpdate — must be a plain function
+// pointer (non-capturing), so canvas/lastPct are file-scope statics instead
+// of a lambda capture. Only redraws on actual percent change to limit
+// e-ink refresh wear during the ~10-20s download.
+static int otaLastDrawnPct = -1;
+void otaProgressCallback(int pct) {
+    if (pct == otaLastDrawnPct) return;
+    otaLastDrawnPct = pct;
+    UI::drawOtaProgress(canvas, pct);
+    pushDisplay();
+}
+
+// Blocking: downloads + flashes the offered update, then reboots. Only
+// called from the OTA prompt's "Install now" action, i.e. with the user
+// physically present and watching the progress screen. Sets the
+// boot-validate flag before restarting so a bad image can't brick the
+// device — see the rollback check at the top of setup().
+void otaInstallNow() {
+    otaLastDrawnPct = -1;
+    UI::drawOtaProgress(canvas, 0);
+    pushDisplay();
+
+    bool ok = Ota::performUpdate(otaAvailableUrl, otaProgressCallback);
+    if (ok) {
+        rtcOtaAvailable = false;
+        rtcOtaValidatePending = true;
+        rtcOtaFailedBoots = 0;
+        Serial.println("[OTA] Flash OK, rebooting into new firmware");
+        delay(200);
+        ESP.restart();
+    } else {
+        canvas.fillSprite(CLR_BG);
+        UI::drawHeader(canvas, "SUNSAMAGOTCHI");
+        canvas.setFont(&fonts::FreeSansBold9pt7b);
+        canvas.setTextColor(CLR_TEXT);
+        int fw = canvas.textWidth("Update failed");
+        canvas.drawString("Update failed", (SCREEN_W - fw) / 2, SCREEN_H / 2 - 8);
+        canvas.setFont(&fonts::Font2);
+        int cw = canvas.textWidth("Old firmware unaffected");
+        canvas.drawString("Old firmware unaffected", (SCREEN_W - cw) / 2, SCREEN_H / 2 + 14);
+        pushDisplay();
+        delay(3000);
+        needsRedraw = true;
+        // Leave rtcOtaAvailable set so the offer resurfaces on next button
+        // wake; the once-a-day manifest check already ran today either way.
+    }
+}
+
 // ─── Timer sync ─────────────────────────────────────────────────────────────
 // Computes elapsed seconds anchored to the last cloud fetch, so the timer
 // stays in sync with Sunsama's cloud timer through deep-sleep cycles.
@@ -432,6 +588,16 @@ void commitAsyncFetch() {
     fetchInProgress = false;
     lastRefresh     = millis();
     needsRedraw     = true;
+
+    // WiFi is already up for this API refresh — piggyback the (throttled,
+    // once-a-day) OTA manifest check on the same radio session instead of
+    // opening a separate one.
+    otaMaybeCheck();
+    if (rtcOtaAvailable && confirmState == CONFIRM_NONE
+        && currentScreen == SCREEN_DASHBOARD && !showingIntro) {
+        confirmState = CONFIRM_OTA_UPDATE;
+        otaPromptSel = OTA_OPT_INSTALL;
+    }
 }
 
 // Convenience wrapper retained for compatibility — kicks off async fetch.
@@ -458,7 +624,7 @@ void redrawScreen() {
             UI::drawDashboard(canvas, currentTime, batt,
                               tasks, taskCount, events, eventCount,
                               planSummary, timerInfo, currentDate,
-                              appSettings.use24h, rtcSunsamaFailed);
+                              appSettings.use24h, rtcSunsamaFailed, rtcOtaAvailable);
             break;
         case SCREEN_TASKS:
             UI::drawTasksScreen(canvas, tasks, taskCount,
@@ -483,7 +649,9 @@ void redrawScreen() {
     }
 
     // Overlay confirmation dialog if active
-    if (confirmState != CONFIRM_NONE) {
+    if (confirmState == CONFIRM_OTA_UPDATE) {
+        UI::drawOtaPrompt(canvas, rtcOtaTag, otaPromptSel);
+    } else if (confirmState != CONFIRM_NONE) {
         const char* dlgTitle = (confirmState == CONFIRM_UNCOMPLETE_TASK)
                              ? "Uncomplete task?" : "Complete task?";
         UI::drawConfirmDialog(canvas, dlgTitle,
@@ -674,6 +842,50 @@ void handleButtons() {
         return;
     }
 
+    // ── OTA update prompt: UP/DOWN cycles Install/Remind/Skip, SELECT executes ──
+    if (confirmState == CONFIRM_OTA_UPDATE) {
+        if (HAL::upPressed() || HAL::downPressed()) {
+            otaPromptSel = (otaPromptSel + 1) % OTA_OPT_COUNT;
+            needsRedraw = true;
+            lastActivity = millis();
+            return;
+        }
+        if (HAL::confirmPressed()) {
+            lastActivity = millis();
+            switch (otaPromptSel) {
+                case OTA_OPT_INSTALL:
+                    confirmState = CONFIRM_NONE;
+                    otaInstallNow();  // blocking; reboots on success
+                    needsRedraw = true;
+                    break;
+                case OTA_OPT_REMIND: {
+                    time_t nowTs; time(&nowTs);
+                    rtcOtaRemindAt = nowTs + 24 * 3600;
+                    confirmState = CONFIRM_NONE;
+                    needsRedraw = true;
+                    break;
+                }
+                case OTA_OPT_SKIP:
+                    Settings::saveOtaSkipTag(appSettings, rtcOtaTag);
+                    rtcOtaAvailable = false;
+                    confirmState = CONFIRM_NONE;
+                    needsRedraw = true;
+                    break;
+            }
+            return;
+        }
+        if (HAL::pagePressed()) {
+            // Dismiss without a decision — treat like "remind tomorrow" so it
+            // doesn't immediately reappear on every subsequent wake.
+            time_t nowTs; time(&nowTs);
+            rtcOtaRemindAt = nowTs + 24 * 3600;
+            confirmState = CONFIRM_NONE;
+            needsRedraw = true;
+            lastActivity = millis();
+        }
+        return;
+    }
+
     // ── Confirmation dialog mode ──
     if (confirmState != CONFIRM_NONE) {
         if (HAL::confirmPressed()) {
@@ -833,7 +1045,11 @@ void handleButtons() {
                 break;
             }
             case SCREEN_SETTINGS: {
-                settingsEditMode = !settingsEditMode;
+                if (settSelIdx == SETT_OTA_CHECK_NOW) {
+                    otaCheckNowInteractive();
+                } else {
+                    settingsEditMode = !settingsEditMode;
+                }
                 needsRedraw = true;
                 break;
             }
@@ -1099,6 +1315,28 @@ void enterDeepSleep() {
 
 // ─── Setup ──────────────────────────────────────────────────────────────────
 void setup() {
+    // ── OTA brick guard ──────────────────────────────────────────────────
+    // If we just rebooted into a freshly-flashed image (rtcOtaValidatePending
+    // set by otaInstallNow() right before ESP.restart()), this runs before
+    // any WiFi/display/MCP work that a bad image might crash inside of.
+    // RTC_DATA_ATTR survives panic/watchdog resets (same power domain as
+    // deep sleep), so a bootloop keeps incrementing rtcOtaFailedBoots across
+    // resets. After MAX_OTA_BOOT_ATTEMPTS we roll back to the other OTA
+    // partition automatically — no button press, no bricked device.
+    if (rtcMagic == RTC_MAGIC && rtcOtaValidatePending) {
+        rtcOtaFailedBoots++;
+        Serial.printf("[OTA] Boot validation pending (attempt %d/%d)\n",
+                      rtcOtaFailedBoots, MAX_OTA_BOOT_ATTEMPTS);
+        if (rtcOtaFailedBoots >= MAX_OTA_BOOT_ATTEMPTS) {
+            Serial.println("[OTA] New image failed to boot — rolling back");
+            const esp_partition_t* prev = esp_ota_get_next_update_partition(nullptr);
+            if (prev) esp_ota_set_boot_partition(prev);
+            rtcOtaValidatePending = false;
+            rtcOtaFailedBoots = 0;
+            esp_restart();
+        }
+    }
+
     HAL::initDevice();
 
     // Load persistent settings from NVS
@@ -1117,6 +1355,14 @@ void setup() {
     // Display init
     canvas.createSprite(SCREEN_W, SCREEN_H);
     canvas.setTextWrap(false);
+
+    // Reaching here proves core boot + display init survived on the new
+    // image — good enough a bar to call it "valid" for a hobby device.
+    if (rtcOtaValidatePending) {
+        Serial.println("[OTA] Boot looks stable — marking image valid");
+        rtcOtaValidatePending = false;
+        rtcOtaFailedBoots = 0;
+    }
 
     // ── Soft wake from deep sleep (button press) ──
     if (isButtonWake && restoreStateFromRTC()) {
@@ -1204,6 +1450,11 @@ void setup() {
                 rtcSunsamaFailed = true;
                 Serial.println("[Data] mcp.begin() failed (Sunsama API unreachable)");
             }
+            // WiFi's already up for this refresh — piggyback the OTA check.
+            // Device is asleep/unattended here, so this only ever sets the
+            // rtcOtaAvailable flag; the interactive prompt is shown on the
+            // next button wake (see commitAsyncFetch()).
+            otaMaybeCheck();
         }
         enterDeepSleep();
         return;

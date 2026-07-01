@@ -271,6 +271,13 @@ inline void initDevice() {
     gpio_deep_sleep_hold_dis();
 #endif
     M5.begin(cfg);
+    // Bluetooth is never initialized by this firmware (no BLE/BT-Classic
+    // library is ever touched), so its ~30KB controller code never gets
+    // linked in and it draws no power — nothing to disable at runtime.
+    // (btStop() here was tried and reverted: calling it pulls in the full
+    // BT controller deinit path just to link, which alone blew the CoreInk
+    // build's fixed 128KB IRAM budget — far more expensive than the OTA
+    // feature it was "helping." Omission beats an explicit disable call.)
 #ifdef BOARD_COREINK
     digitalWrite(12, HIGH);       // belt-and-suspenders after M5.begin
     M5.Display.setRotation(0);    // Portrait 200x200

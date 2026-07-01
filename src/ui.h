@@ -32,6 +32,15 @@ enum ConfirmState : uint8_t {
     CONFIRM_NONE = 0,
     CONFIRM_COMPLETE_TASK,
     CONFIRM_UNCOMPLETE_TASK,
+    CONFIRM_OTA_UPDATE,
+};
+
+// Options cycled with UP/DOWN inside the OTA update prompt.
+enum OtaPromptOption : uint8_t {
+    OTA_OPT_INSTALL = 0,
+    OTA_OPT_REMIND,
+    OTA_OPT_SKIP,
+    OTA_OPT_COUNT,
 };
 
 // ─── Task / Event data ──────────────────────────────────────────────────────
@@ -180,7 +189,8 @@ inline void formatApiTime(char* out, size_t outSz, const char* apiTime, bool use
 
 // ── Decorative elements ─────────────────────────────────────────────────────
 
-inline void drawHeader(M5Canvas& c, const char* title, const uint8_t* icon = nullptr, bool sunsamaFailed = false) {
+inline void drawHeader(M5Canvas& c, const char* title, const uint8_t* icon = nullptr,
+                        bool sunsamaFailed = false, bool otaAvailable = false) {
     c.fillRect(0, 0, SCREEN_W, HDR_H, CLR_HEADER_BG);
     c.setTextColor(CLR_HEADER_TEXT);
     c.setFont(&fonts::Font2);
@@ -197,6 +207,14 @@ inline void drawHeader(M5Canvas& c, const char* title, const uint8_t* icon = nul
         c.fillRect(bx, by, 16, 10, CLR_HEADER_BG);
         c.drawRect(bx, by, 16, 10, CLR_HEADER_TEXT);
         c.drawString("!", bx + 5, by - 1);
+    }
+    // A newer firmware build was found on the selected OTA channel and is
+    // waiting for the user to Install/Remind/Skip — see CONFIRM_OTA_UPDATE.
+    if (otaAvailable) {
+        int bx = SCREEN_W - 64, by = (HDR_H - 10) / 2;
+        c.fillRect(bx, by, 16, 10, CLR_HEADER_BG);
+        c.drawRect(bx, by, 16, 10, CLR_HEADER_TEXT);
+        c.drawString("^", bx + 5, by - 1);
     }
 }
 
@@ -461,10 +479,10 @@ inline void drawDashboard(M5Canvas& c, const char* timeStr, int batt,
                           EventItem* events, uint8_t eventCount,
                           PlanSummary& plan, TimerInfo& timer,
                           const char* dateStr, bool use24h,
-                          bool sunsamaFailed = false)
+                          bool sunsamaFailed = false, bool otaAvailable = false)
 {
     c.fillSprite(CLR_BG);
-    drawHeader(c, "SUNSAMAGOTCHI", nullptr, sunsamaFailed);
+    drawHeader(c, "SUNSAMAGOTCHI", nullptr, sunsamaFailed, otaAvailable);
     drawBattery(c, batt);
 
 #if IS_EINK
@@ -1541,6 +1559,84 @@ inline void drawConfirmDialog(M5Canvas& c, const char* title, const char* messag
 #endif
     int hintW = c.textWidth(confHint);
     c.drawString(confHint, (SCREEN_W - hintW) / 2, by + bh - 18);
+}
+
+// ── OTA update prompt — 3 cycleable options (Install / Remind / Skip) ───────
+inline void drawOtaPrompt(M5Canvas& c, const char* tag, uint8_t sel) {
+    int bw = SCREEN_W - 20;
+    int bh = IS_EINK ? 110 : 92;
+    int bx = 10;
+    int by = (SCREEN_H - bh) / 2;
+
+    c.fillRect(bx, by, bw, bh, CLR_BG);
+    c.drawRect(bx, by, bw, bh, CLR_TEXT);
+    c.drawRect(bx + 1, by + 1, bw - 2, bh - 2, CLR_TEXT);
+
+    c.setFont(&fonts::FreeSansBold9pt7b);
+    c.setTextColor(CLR_TEXT);
+    const char* title = "Update available";
+    int tw = c.textWidth(title);
+    c.drawString(title, (SCREEN_W - tw) / 2, by + 6);
+
+    c.setFont(&fonts::Font0);
+    char sub[40]; snprintf(sub, sizeof(sub), "fw %s", tag);
+    char subTrunc[36]; truncPx(c, subTrunc, sub, bw - 16);
+    int sw = c.textWidth(subTrunc);
+    c.drawString(subTrunc, (SCREEN_W - sw) / 2, by + 26);
+
+    static const char* OPT_LABEL[OTA_OPT_COUNT] = {
+        "Install now", "Remind me tomorrow", "Skip this version",
+    };
+    int rowH = 18;
+    int rowY = by + 38;
+    for (uint8_t i = 0; i < OTA_OPT_COUNT; i++) {
+        int iy = rowY + i * rowH;
+        bool sel_ = (i == sel);
+        if (sel_) {
+            c.fillRoundRect(bx + 6, iy, bw - 12, rowH - 2, 3, CLR_SELECTED_BG);
+            c.setTextColor(CLR_SELECTED_TEXT);
+        } else {
+            c.setTextColor(CLR_TEXT);
+        }
+        c.drawString(OPT_LABEL[i], bx + 12, iy + 2);
+    }
+
+    c.setFont(&fonts::Font0);
+    c.setTextColor(CLR_TEXT_DIM);
+#if IS_EINK
+    const char* hint = "UP/DOWN=choose  PRESS=confirm";
+#else
+    const char* hint = "UP/DOWN=choose  SELECT=confirm";
+#endif
+    int hw = c.textWidth(hint);
+    c.drawString(hint, (SCREEN_W - hw) / 2, by + bh - 12);
+}
+
+// ── OTA flash progress (blocking screen, shown only during active install) ──
+inline void drawOtaProgress(M5Canvas& c, int pct) {
+    c.fillSprite(CLR_BG);
+    c.setFont(&fonts::FreeSansBold9pt7b);
+    c.setTextColor(CLR_TEXT);
+    const char* title = "Installing update...";
+    int tw = c.textWidth(title);
+    c.drawString(title, (SCREEN_W - tw) / 2, SCREEN_H / 2 - 22);
+
+    int barW = SCREEN_W - 40, barH = 14;
+    int barX = 20, barY = SCREEN_H / 2;
+    c.drawRect(barX, barY, barW, barH, CLR_TEXT);
+    int fillW = (barW - 4) * pct / 100;
+    if (fillW > 0) c.fillRect(barX + 2, barY + 2, fillW, barH - 4, CLR_TEXT);
+
+    c.setFont(&fonts::Font2);
+    char pctStr[8]; snprintf(pctStr, sizeof(pctStr), "%d%%", pct);
+    int pw = c.textWidth(pctStr);
+    c.drawString(pctStr, (SCREEN_W - pw) / 2, barY + barH + 8);
+
+    c.setFont(&fonts::Font0);
+    c.setTextColor(CLR_TEXT_DIM);
+    const char* warn = "Do not power off";
+    int ww = c.textWidth(warn);
+    c.drawString(warn, (SCREEN_W - ww) / 2, SCREEN_H - 16);
 }
 
 // ── Completion animation ────────────────────────────────────────────────────
