@@ -328,6 +328,12 @@ void otaMaybeCheck() {
 
     if (rtcOtaRemindAt > nowTs) return;  // user asked to be reminded later, not yet due
 
+    // The API refresh that triggered this call just left mcp's TLS session
+    // open for reuse; it must be torn down before OTA opens its own
+    // WiFiClientSecure or the two mbedTLS contexts fight over heap and the
+    // manifest fetch's handshake can fail allocation intermittently.
+    mcp.stop();
+
     Ota::CheckResult res;
     if (!Ota::check(appSettings.otaChannel, res)) return;
 
@@ -366,6 +372,11 @@ void otaCheckNowInteractive() {
         needsRedraw = true;
         return;
     }
+
+    // Free MCP's persistent TLS session first — it holds a live mbedTLS
+    // context that competes with OTA's own WiFiClientSecure for the same
+    // scarce contiguous heap, causing intermittent SSL alloc failures.
+    mcp.stop();
 
     Ota::CheckResult res;
     bool available = Ota::check(appSettings.otaChannel, res);
@@ -409,6 +420,7 @@ void otaInstallNow() {
     UI::drawOtaStatus(canvas, "Installing update", nullptr, 0);
     pushDisplay();
 
+    mcp.stop();  // see otaCheckNowInteractive — must not race OTA's TLS session
     bool ok = Ota::performUpdate(otaAvailableUrl, otaProgressCallback);
     if (ok) {
         rtcOtaAvailable = false;
