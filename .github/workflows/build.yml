@@ -2,7 +2,7 @@ name: Build Firmware
 
 on:
   push:
-    branches: [master]
+    branches: [dev, beta, master]
     paths:
       - 'src/**'
       - 'platformio.ini'
@@ -52,22 +52,59 @@ jobs:
           cp .pio/build/m5stick-cplus2/firmware.bin     dist/stickc-app.bin
           ls -lh dist/
 
+      # --- dev: build-only smoke test, no release, no downstream deploy ---
+      - name: Upload dev build artifact
+        if: github.ref == 'refs/heads/dev'
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-dev-${{ github.sha }}
+          path: dist/*.bin
+          retention-days: 14
+
+      # --- beta / master: derive a version tag and cut a release ---
       - name: Derive version tag
+        if: github.ref == 'refs/heads/beta' || github.ref == 'refs/heads/master'
         id: tag
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
           DATE=$(date -u +%Y%m%d)
-          echo "tag=firmware-${DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "name=Firmware ${DATE} (${SHORT_SHA})" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF##*/}" = "beta" ]; then
+            echo "tag=beta-${DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+            echo "name=Beta ${DATE} (${SHORT_SHA})" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "dispatch_event=firmware-beta" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=firmware-${DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+            echo "name=Firmware ${DATE} (${SHORT_SHA})" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "dispatch_event=firmware-release" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create GitHub Release
+        if: github.ref == 'refs/heads/beta' || github.ref == 'refs/heads/master'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.name }}
+          prerelease: ${{ steps.tag.outputs.prerelease }}
           body: |
-            Auto-built from commit ${{ github.sha }}.
+            Auto-built from commit ${{ github.sha }} on `${{ github.ref_name }}`.
 
-            Flash via the web flasher: https://sunsamagotchi.pages.dev
+            ${{ steps.tag.outputs.prerelease == 'true' && 'Beta build — flash via the web flasher beta channel before promoting to master.' || 'Stable release — flash via the web flasher: https://sunsamagotchi.marinbenke.dev' }}
           files: dist/*.bin
           fail_on_unmatched_files: true
+
+      # Notify sunsamagotchi-web so it can pull this build onto the matching
+      # channel (beta -> preview deploy, master -> production deploy).
+      # Requires WEB_REPO_DISPATCH_TOKEN: a PAT with `repo` scope on
+      # sunsamagotchi-web, since the default GITHUB_TOKEN can't trigger
+      # workflows in another repository.
+      - name: Notify web flasher repo
+        if: github.ref == 'refs/heads/beta' || github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ secrets.WEB_REPO_DISPATCH_TOKEN }}
+        run: |
+          gh api repos/MarinGHG/sunsamagotchi-web/dispatches \
+            -f event_type="${{ steps.tag.outputs.dispatch_event }}" \
+            -f "client_payload[tag]=${{ steps.tag.outputs.tag }}" \
+            -f "client_payload[sha]=${{ github.sha }}"
