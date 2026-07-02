@@ -9,6 +9,13 @@
 #include "net_cfg.h"
 #include "settings.h"
 
+// PlatformIO injects the real value via scripts/version.py (git tag/describe,
+// or the exact release tag in CI). This is only a fallback for IDEs/build
+// setups that skip extra_scripts.
+#ifndef FIRMWARE_VERSION
+#define FIRMWARE_VERSION "dev-local"
+#endif
+
 // ─── Screen IDs ─────────────────────────────────────────────────────────────
 enum Screen : uint8_t {
     SCREEN_DASHBOARD = 0,
@@ -25,6 +32,15 @@ enum ConfirmState : uint8_t {
     CONFIRM_NONE = 0,
     CONFIRM_COMPLETE_TASK,
     CONFIRM_UNCOMPLETE_TASK,
+    CONFIRM_OTA_UPDATE,
+};
+
+// Options cycled with UP/DOWN inside the OTA update prompt.
+enum OtaPromptOption : uint8_t {
+    OTA_OPT_INSTALL = 0,
+    OTA_OPT_REMIND,
+    OTA_OPT_SKIP,
+    OTA_OPT_COUNT,
 };
 
 // ─── Task / Event data ──────────────────────────────────────────────────────
@@ -173,7 +189,8 @@ inline void formatApiTime(char* out, size_t outSz, const char* apiTime, bool use
 
 // ── Decorative elements ─────────────────────────────────────────────────────
 
-inline void drawHeader(M5Canvas& c, const char* title, const uint8_t* icon = nullptr) {
+inline void drawHeader(M5Canvas& c, const char* title, const uint8_t* icon = nullptr,
+                        bool sunsamaFailed = false, bool otaAvailable = false) {
     c.fillRect(0, 0, SCREEN_W, HDR_H, CLR_HEADER_BG);
     c.setTextColor(CLR_HEADER_TEXT);
     c.setFont(&fonts::Font2);
@@ -183,6 +200,21 @@ inline void drawHeader(M5Canvas& c, const char* title, const uint8_t* icon = nul
         c.drawString(title, 16, textY);
     } else {
         c.drawString(title, 5, textY);
+    }
+    // WiFi is up but the last Sunsama API call failed — distinct from a WiFi outage.
+    if (sunsamaFailed) {
+        int bx = SCREEN_W - 44, by = (HDR_H - 10) / 2;
+        c.fillRect(bx, by, 16, 10, CLR_HEADER_BG);
+        c.drawRect(bx, by, 16, 10, CLR_HEADER_TEXT);
+        c.drawString("!", bx + 5, by - 1);
+    }
+    // A newer firmware build was found on the selected OTA channel and is
+    // waiting for the user to Install/Remind/Skip — see CONFIRM_OTA_UPDATE.
+    if (otaAvailable) {
+        int bx = SCREEN_W - 64, by = (HDR_H - 10) / 2;
+        c.fillRect(bx, by, 16, 10, CLR_HEADER_BG);
+        c.drawRect(bx, by, 16, 10, CLR_HEADER_TEXT);
+        c.drawString("^", bx + 5, by - 1);
     }
 }
 
@@ -389,24 +421,27 @@ inline void drawIntroScreen(M5Canvas& c) {
 #endif
 
 #if IS_EINK
-    // CoreInk 200x200: character centred, description + hints below
-    drawSunsamagotchiChar(c, 100, 82, 36);
+    // CoreInk 200x200: character centred, description + hints below.
+    // Everything below the dotted line must clear the footer band
+    // (SCREEN_H - FOOT_H = 178) so the "Press SELECT" footer hint never
+    // overlaps the control list — that overlap was the "jammed" intro bug.
+    drawSunsamagotchiChar(c, 100, 68, 28);
 
     c.setTextColor(CLR_TEXT);
     c.setFont(&fonts::FreeSansBold9pt7b);
     int nw = c.textWidth("Sunsamagotchi");
-    c.drawString("Sunsamagotchi", (SCREEN_W - nw) / 2, 134);
+    c.drawString("Sunsamagotchi", (SCREEN_W - nw) / 2, 104);
     c.setFont(&fonts::Font2);
     int sw = c.textWidth("Your pocket Sunsama friend!");
-    c.drawString("Your pocket Sunsama friend!", (SCREEN_W - sw) / 2, 153);
+    c.drawString("Your pocket Sunsama friend!", (SCREEN_W - sw) / 2, 122);
 
-    drawDottedLine(c, 170);
+    drawDottedLine(c, 138);
 
     c.setFont(&fonts::Font0);
     c.setTextColor(CLR_TEXT);
-    c.drawString("Dial UP/DOWN  scroll lists", 8, 175);
-    c.drawString("Dial PRESS    select / confirm", 8, 186);
-    c.drawString("Top button    next page", 8, 197);
+    c.drawString("Dial UP/DOWN  scroll lists", 8, 144);
+    c.drawString("Dial PRESS    select / confirm", 8, 155);
+    c.drawString("Top button    next page", 8, 166);
 
 #else
     // StickC 240x135: character left, text right
@@ -443,10 +478,11 @@ inline void drawDashboard(M5Canvas& c, const char* timeStr, int batt,
                           TaskItem* tasks, uint8_t taskCount,
                           EventItem* events, uint8_t eventCount,
                           PlanSummary& plan, TimerInfo& timer,
-                          const char* dateStr, bool use24h)
+                          const char* dateStr, bool use24h,
+                          bool sunsamaFailed = false, bool otaAvailable = false)
 {
     c.fillSprite(CLR_BG);
-    drawHeader(c, "SUNSAMAGOTCHI");
+    drawHeader(c, "SUNSAMAGOTCHI", nullptr, sunsamaFailed, otaAvailable);
     drawBattery(c, batt);
 
 #if IS_EINK
@@ -853,6 +889,244 @@ inline void drawEventsScreen(M5Canvas& c, EventItem* events, uint8_t eventCount,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ── Calendar standby screen ─────────────────────────────────────────────────
+//
+// A Sunsama-style day timeline used as an alternative deep-sleep (standby)
+// layout.  Top to bottom is the flow of time; the current moment sits on a
+// bold line in the vertical centre, with its clock time pinned in the left
+// gutter.  Only a ±3 h window (6 h total) is shown, so the day appears to
+// scroll upward as time passes.  Hour markers label the gutter; timeboxed
+// tasks and calendar events are drawn as blocks positioned and sized by their
+// start time and duration, with overlapping blocks split into side-by-side
+// columns (lanes), exactly like a real calendar.
+// ═══════════════════════════════════════════════════════════════════════════
+
+inline void drawCalendarStandby(M5Canvas& c,
+                                EventItem* events, uint8_t eventCount,
+                                TaskItem* tasks, uint8_t taskCount,
+                                const char* dateStr, const char* timeStr,
+                                bool use24h, int batt, const char* ageStr,
+                                bool timerActive, uint32_t timerElapsedSec)
+{
+    c.fillSprite(CLR_BG);
+
+    // ── Current time as minutes-of-day (centre of the window) ─────────────────
+    struct tm now_tm;
+    int nowMins = 12 * 60;
+    if (getLocalTime(&now_tm, 0)) nowMins = now_tm.tm_hour * 60 + now_tm.tm_min;
+
+    // ── Top strip: date (left), running timer + sync age + battery (right) ────
+    const int topH = IS_EINK ? 15 : 13;
+    c.setFont(&fonts::Font0);
+    c.setTextColor(CLR_TEXT);
+    c.drawString(dateStr, PAD, (topH - 8) / 2);
+
+    char rstr[28];
+    char timerStr[12] = "";
+    if (timerActive) {
+        char el[10];
+        formatElapsedMin(el, sizeof(el), timerElapsedSec);
+        snprintf(timerStr, sizeof(timerStr), "%s ", el);
+    }
+    if (ageStr && ageStr[0])
+        snprintf(rstr, sizeof(rstr), "%s%s  %d%%", timerStr, ageStr, batt);
+    else
+        snprintf(rstr, sizeof(rstr), "%s%d%%", timerStr, batt);
+    c.setTextColor(CLR_TEXT_DIM);
+    int rw = c.textWidth(rstr);
+    c.drawString(rstr, SCREEN_W - rw - PAD, (topH - 8) / 2);
+    c.setTextColor(CLR_TEXT);
+    drawDottedLine(c, topH);
+
+    // ── Timeline geometry ─────────────────────────────────────────────────────
+    const int WINDOW   = 360;                 // ±3 h → 6 h total visible
+    const int gutterW  = IS_EINK ? 40 : 38;   // room for the "HH:MM" now-chip
+    const int colX     = gutterW;             // left edge of the block columns
+    const int colW     = SCREEN_W - colX - PAD;
+    const int top      = topH + 2;
+    const int bot      = SCREEN_H - 1;
+    const int availH   = bot - top;
+    const float pxPerMin = (float)availH / (float)WINDOW;
+    const int yCenter  = top + availH / 2;
+    const int winStart = nowMins - WINDOW / 2;
+    const int winEnd   = nowMins + WINDOW / 2;
+
+    auto yOf = [&](int t) -> int {
+        int y = yCenter + (int)lroundf((t - nowMins) * pxPerMin);
+        if (y < top) y = top;
+        if (y > bot) y = bot;
+        return y;
+    };
+
+    // ── Hour gridlines + gutter labels ────────────────────────────────────────
+    c.setFont(&fonts::Font0);
+    for (int h = (winStart - 60) / 60; h <= (winEnd + 60) / 60; h++) {
+        int hm = h * 60;
+        if (hm < winStart || hm > winEnd) continue;
+        int hy = yOf(hm);
+        drawDottedLine(c, hy, colX, SCREEN_W - PAD);
+        int hh = ((h % 24) + 24) % 24;
+        char hlbl[8];
+        if (use24h) {
+            snprintf(hlbl, sizeof(hlbl), "%d:00", hh);
+        } else {
+            int h12 = hh % 12; if (h12 == 0) h12 = 12;
+            snprintf(hlbl, sizeof(hlbl), "%d%s", h12, hh < 12 ? "a" : "p");
+        }
+        c.setTextColor(CLR_TEXT_DIM);
+        int lw = c.textWidth(hlbl);
+        c.drawString(hlbl, colX - lw - 3, hy - 3);
+        c.setTextColor(CLR_TEXT);
+    }
+
+    // ── Gather visible blocks (events + timeboxed tasks) ──────────────────────
+    struct Blk { int s; int e; const char* title; bool isTask; bool done;
+                 int lane; int lanes; };
+    static Blk blk[MAX_EVENTS + MAX_TASKS];
+    int nb = 0;
+
+    auto addBlock = [&](int s, int e, const char* title, bool isTask, bool done) {
+        if (s < 0 || e <= s) return;
+        // Fold across midnight so late-night windows still catch early/late blocks.
+        if (e <= winStart && s + 1440 <= winEnd) { s += 1440; e += 1440; }
+        else if (s >= winEnd && e - 1440 >= winStart) { s -= 1440; e -= 1440; }
+        if (e <= winStart || s >= winEnd) return;          // outside window
+        if (nb >= MAX_EVENTS + MAX_TASKS) return;
+        blk[nb++] = { s, e, title, isTask, done, 0, 1 };
+    };
+
+    for (int i = 0; i < eventCount; i++) {
+        EventItem& ev = events[i];
+        if (ev.isAllDay) continue;
+        int s = apiTimeToMinutes(ev.startTime);
+        if (s < 0) continue;
+        int e = s + (ev.durationMin > 0 ? ev.durationMin : 30);
+        addBlock(s, e, ev.title, false, false);
+    }
+    for (int i = 0; i < taskCount; i++) {
+        TaskItem& tk = tasks[i];
+        if (!tk.projStart[0] || !tk.projEnd[0]) continue;
+        int s = apiTimeToMinutes(tk.projStart);
+        int e = apiTimeToMinutes(tk.projEnd);
+        if (s < 0 || e < 0) continue;
+        addBlock(s, e, tk.title, true, tk.completed);
+    }
+
+    // ── Lane assignment: split overlapping blocks into side-by-side columns ───
+    // Sort by start (insertion sort — nb is tiny).
+    for (int i = 1; i < nb; i++) {
+        Blk key = blk[i];
+        int j = i - 1;
+        while (j >= 0 && blk[j].s > key.s) { blk[j + 1] = blk[j]; j--; }
+        blk[j + 1] = key;
+    }
+    for (int i = 0; i < nb; ) {
+        int clusterEnd = blk[i].e;
+        int j = i + 1;
+        while (j < nb && blk[j].s < clusterEnd) {
+            if (blk[j].e > clusterEnd) clusterEnd = blk[j].e;
+            j++;
+        }
+        int laneEnd[8]; int nLanes = 0;
+        for (int k = i; k < j; k++) {
+            int placed = -1;
+            for (int l = 0; l < nLanes; l++) {
+                if (blk[k].s >= laneEnd[l]) { placed = l; break; }
+            }
+            if (placed < 0) { placed = nLanes; if (nLanes < 8) nLanes++; }
+            laneEnd[placed] = blk[k].e;
+            blk[k].lane = placed;
+        }
+        for (int k = i; k < j; k++) blk[k].lanes = (nLanes < 1 ? 1 : nLanes);
+        i = j;
+    }
+
+    // ── Draw blocks ───────────────────────────────────────────────────────────
+    for (int i = 0; i < nb; i++) {
+        Blk& b = blk[i];
+        int y0 = yOf(b.s);
+        int y1 = yOf(b.e);
+        int h = y1 - y0;
+        if (h < 9) h = 9;                       // keep room for one text line
+        int laneW = colW / b.lanes;
+        int bx = colX + b.lane * laneW;
+        int bw = laneW - 1;
+        if (bw < 12) bw = 12;
+
+        uint16_t barColor = b.isTask ? CLR_ACCENT2 : CLR_ACCENT;
+        // Body
+        c.fillRect(bx + 3, y0, bw - 3, h, IS_COLOR ? CLR_CARD_BG : CLR_BG);
+        c.drawRect(bx, y0, bw, h, b.done ? CLR_DIVIDER : barColor);
+        // Type marker on the left edge: events = solid bar, tasks = striped bar
+        // (the stripe distinguishes them on monochrome e-ink too).
+        if (b.isTask) {
+            for (int yy = y0 + 1; yy < y0 + h - 1; yy += 2)
+                c.drawFastHLine(bx, yy, 3, b.done ? CLR_DIVIDER : barColor);
+        } else {
+            c.fillRect(bx, y0, 3, h, barColor);
+        }
+
+        // Text — time line then title when tall enough, else title only.
+        uint16_t txtColor = b.done ? CLR_TEXT_DIM : CLR_TEXT;
+        int tx = bx + 6;
+        int tw = bw - 8;
+        if (tw < 10) { continue; }
+        // Build start-time label from minutes-of-day.
+        char ts[12];
+        {
+            int sm = ((b.s % 1440) + 1440) % 1440;
+            int sh = sm / 60, smin = sm % 60;
+            if (use24h) snprintf(ts, sizeof(ts), "%d:%02d", sh, smin);
+            else {
+                int h12 = sh % 12; if (h12 == 0) h12 = 12;
+                snprintf(ts, sizeof(ts), "%d:%02d%s", h12, smin, sh < 12 ? "a" : "p");
+            }
+        }
+        c.setTextColor(txtColor);
+        if (h >= 24) {
+            c.setFont(&fonts::Font0);
+            char tline[12]; truncPx(c, tline, ts, tw);
+            c.drawString(tline, tx, y0 + 2);
+            c.setFont(&fonts::Font2);
+            char tt[48]; truncPx(c, tt, b.title, tw);
+            c.drawString(tt, tx, y0 + 10);
+        } else {
+            c.setFont(&fonts::Font0);
+            char tt[48]; truncPx(c, tt, b.title, tw);
+            c.drawString(tt, tx, y0 + (h - 8) / 2);
+        }
+        c.setTextColor(CLR_TEXT);
+    }
+
+    if (nb == 0) {
+        c.setFont(&fonts::Font2);
+        c.setTextColor(CLR_TEXT_DIM);
+        const char* msg = "No events or tasks";
+        int mw = c.textWidth(msg);
+        c.drawString(msg, colX + (colW - mw) / 2, top + 6);
+        c.setTextColor(CLR_TEXT);
+    }
+
+    // ── "Now" line (drawn last so it sits on top of blocks) ───────────────────
+    c.drawFastHLine(colX, yCenter, SCREEN_W - colX - PAD, CLR_ACCENT);
+    if (IS_EINK) c.drawFastHLine(colX, yCenter + 1, SCREEN_W - colX - PAD, CLR_ACCENT);
+    c.fillCircle(colX, yCenter, 2, CLR_ACCENT);
+
+    // Current time pinned in the gutter on an accent chip for emphasis.  The
+    // chip may overhang the first column slightly — it sits on top, like the
+    // current-time pill in Sunsama.
+    c.setFont(&fonts::Font2);
+    int ctw = c.textWidth(timeStr);
+    int chipH = 16;
+    int chipY = yCenter - chipH / 2;
+    int chipW = ctw + 6;
+    c.fillRect(0, chipY, chipW, chipH, CLR_ACCENT);
+    c.setTextColor(IS_COLOR ? TFT_WHITE : CLR_BG);
+    c.drawString(timeStr, 3, chipY);
+    c.setTextColor(CLR_TEXT);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // ── Timer screen ────────────────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1175,16 +1449,23 @@ inline void drawStatsScreen(M5Canvas& c, TaskItem* tasks, uint8_t taskCount,
 // ═══════════════════════════════════════════════════════════════════════════
 
 inline void drawSettingsScreen(M5Canvas& c, const AppSettings& settings,
-                                uint8_t selIdx, int batt, bool editMode)
+                                uint8_t selIdx, int batt, bool editMode,
+                                uint8_t scrollOff = 0)
 {
     c.fillSprite(CLR_BG);
     drawHeader(c, "SETTINGS", ICON_GEAR);
 
     int yOff = BODY_TOP + 2;
-    int rowH = IS_EINK ? 22 : 20;
+    // Fixed, comfortable row height — the list scrolls (like Tasks/Events)
+    // instead of rows shrinking indefinitely as SETT_COUNT grows.
+    int infoH = IS_EINK ? 30 : 14;
+    int rowH  = IS_EINK ? 22 : 20;
+    int maxVis = (BODY_BOT - yOff - infoH) / rowH;
+    if (maxVis < 1) maxVis = 1;
 
-    for (uint8_t i = 0; i < SETT_COUNT; i++) {
-        int iy = yOff + i * rowH;
+    for (uint8_t vi = 0; vi < maxVis && (scrollOff + vi) < SETT_COUNT; vi++) {
+        uint8_t i = scrollOff + vi;
+        int iy = yOff + vi * rowH;
         bool sel = (i == selIdx);
 
         if (sel) {
@@ -1195,7 +1476,9 @@ inline void drawSettingsScreen(M5Canvas& c, const AppSettings& settings,
         }
 
         c.setFont(&fonts::Font2);
-        c.drawString(Settings::itemLabel((SettingsItem)i), PAD + 4, iy + (rowH - 16) / 2);
+        const char* label = Settings::itemLabel((SettingsItem)i);
+        int labelW = c.textWidth(label);
+        c.drawString(label, PAD + 4, iy + (rowH - 16) / 2);
 
         char val[16];
         Settings::formatValue(val, sizeof(val), settings, (SettingsItem)i);
@@ -1206,29 +1489,52 @@ inline void drawSettingsScreen(M5Canvas& c, const AppSettings& settings,
             char editVal[20];
             snprintf(editVal, sizeof(editVal), "< %s >", val);
             vw = c.textWidth(editVal);
-            c.drawString(editVal, SCREEN_W - vw - PAD - 2, iy + (rowH - 16) / 2);
-        } else {
-            c.drawString(val, SCREEN_W - vw - PAD - 2, iy + (rowH - 16) / 2);
+        }
+
+        // Long label + value can collide (e.g. "Check for update" / "Press
+        // SELECT" both at Font2 width overrun 200px CoreInk screens) — only
+        // draw the value if it fits clear of the label instead of overlapping.
+        int valX = SCREEN_W - vw - PAD - 2;
+        if (valX > PAD + 4 + labelW + 4) {
+            if (sel && editMode) {
+                char editVal[20];
+                snprintf(editVal, sizeof(editVal), "< %s >", val);
+                c.drawString(editVal, valX, iy + (rowH - 16) / 2);
+            } else {
+                c.drawString(val, valX, iy + (rowH - 16) / 2);
+            }
         }
 
         c.setTextColor(CLR_TEXT);
     }
 
+    // Scroll indicators — same triangle style as Tasks/Events
+    if (scrollOff > 0) {
+        c.fillTriangle(SCREEN_W - 10, yOff - 1, SCREEN_W - 14, yOff + 3, SCREEN_W - 6, yOff + 3, CLR_TEXT);
+    }
+    if (scrollOff + maxVis < SETT_COUNT) {
+        int by = yOff + maxVis * rowH - 5;
+        c.fillTriangle(SCREEN_W - 10, by + 4, SCREEN_W - 14, by, SCREEN_W - 6, by, CLR_TEXT);
+    }
+
     // Device info below settings
-    int infoY = yOff + SETT_COUNT * rowH + 4;
+    int infoY = yOff + maxVis * rowH + 4;
     drawDottedLine(c, infoY);
     infoY += 4;
     c.setFont(&fonts::Font0);
     c.setTextColor(CLR_TEXT_DIM);
     char info[48];
+    char fwShort[20];
+    trunc(fwShort, FIRMWARE_VERSION, sizeof(fwShort));
 #if IS_EINK
     snprintf(info, sizeof(info), "WiFi: %s  Batt: %d%%", NetCfg::ssid(), batt);
     c.drawString(info, PAD + 2, infoY);
-    c.drawString("Sunsamagotchi | M5Stack CoreInk", PAD + 2, infoY + 12);
+    snprintf(info, sizeof(info), "CoreInk | fw %s", fwShort);
+    c.drawString(info, PAD + 2, infoY + 12);
 #else
-    // StickC: limited vertical space — single compact line
-    snprintf(info, sizeof(info), "Batt: %d%%  WiFi: %s", batt,
-             WiFi.status() == WL_CONNECTED ? "OK" : "offline");
+    // StickC: limited vertical space — single compact line, version wins over
+    // WiFi status here since that's already visible via the header icon.
+    snprintf(info, sizeof(info), "Batt: %d%%  fw %s", batt, fwShort);
     c.drawString(info, PAD + 2, infoY);
 #endif
 
@@ -1276,6 +1582,111 @@ inline void drawConfirmDialog(M5Canvas& c, const char* title, const char* messag
 #endif
     int hintW = c.textWidth(confHint);
     c.drawString(confHint, (SCREEN_W - hintW) / 2, by + bh - 18);
+}
+
+// ── OTA update prompt — 3 cycleable options (Install / Remind / Skip) ───────
+inline void drawOtaPrompt(M5Canvas& c, const char* tag, uint8_t sel) {
+    int bw = SCREEN_W - 20;
+    int bh = IS_EINK ? 110 : 92;
+    int bx = 10;
+    int by = (SCREEN_H - bh) / 2;
+
+    c.fillRect(bx, by, bw, bh, CLR_BG);
+    c.drawRect(bx, by, bw, bh, CLR_TEXT);
+    c.drawRect(bx + 1, by + 1, bw - 2, bh - 2, CLR_TEXT);
+
+    c.setFont(&fonts::FreeSansBold9pt7b);
+    c.setTextColor(CLR_TEXT);
+    const char* title = "Update available";
+    int tw = c.textWidth(title);
+    c.drawString(title, (SCREEN_W - tw) / 2, by + 6);
+
+    c.setFont(&fonts::Font0);
+    char sub[40]; snprintf(sub, sizeof(sub), "fw %s", tag);
+    char subTrunc[36]; truncPx(c, subTrunc, sub, bw - 16);
+    int sw = c.textWidth(subTrunc);
+    c.drawString(subTrunc, (SCREEN_W - sw) / 2, by + 26);
+
+    static const char* OPT_LABEL[OTA_OPT_COUNT] = {
+        "Install now", "Remind me tomorrow", "Skip this version",
+    };
+    int rowH = 18;
+    int rowY = by + 38;
+    for (uint8_t i = 0; i < OTA_OPT_COUNT; i++) {
+        int iy = rowY + i * rowH;
+        bool sel_ = (i == sel);
+        if (sel_) {
+            c.fillRoundRect(bx + 6, iy, bw - 12, rowH - 2, 3, CLR_SELECTED_BG);
+            c.setTextColor(CLR_SELECTED_TEXT);
+        } else {
+            c.setTextColor(CLR_TEXT);
+        }
+        c.drawString(OPT_LABEL[i], bx + 12, iy + 2);
+    }
+
+    c.setFont(&fonts::Font0);
+    c.setTextColor(CLR_TEXT_DIM);
+#if IS_EINK
+    const char* hint = "UP/DOWN=choose  PRESS=confirm";
+#else
+    const char* hint = "UP/DOWN=choose  SELECT=confirm";
+#endif
+    int hw = c.textWidth(hint);
+    c.drawString(hint, (SCREEN_W - hw) / 2, by + bh - 12);
+}
+
+// ── OTA status screen — used for every blocking OTA phase (checking,
+// downloading/flashing, success, failure) so text width/padding is handled
+// in exactly one place instead of ad-hoc canvas calls scattered per call
+// site. pct < 0 means "no determinate progress" (e.g. the manifest check,
+// which is a single quick request with nothing to report a percentage on):
+// draws a plain indeterminate "working" bar instead of a percentage fill.
+inline void drawOtaStatus(M5Canvas& c, const char* title, const char* subtitle = nullptr, int pct = -1) {
+    c.fillSprite(CLR_BG);
+
+    c.setFont(&fonts::FreeSansBold9pt7b);
+    c.setTextColor(CLR_TEXT);
+    char t[28]; truncPx(c, t, title, SCREEN_W - 2 * PAD - 8);
+    int tw = c.textWidth(t);
+    int titleY = SCREEN_H / 2 - 30;
+    c.drawString(t, (SCREEN_W - tw) / 2, titleY);
+
+    if (subtitle) {
+        c.setFont(&fonts::Font2);
+        c.setTextColor(CLR_TEXT_DIM);
+        char s[36]; truncPx(c, s, subtitle, SCREEN_W - 2 * PAD - 8);
+        int sw = c.textWidth(s);
+        c.drawString(s, (SCREEN_W - sw) / 2, titleY + 20);
+        c.setTextColor(CLR_TEXT);
+    }
+
+    int barW = SCREEN_W - 40, barH = 14;
+    int barX = 20, barY = SCREEN_H / 2 + 6;
+    c.drawRect(barX, barY, barW, barH, CLR_TEXT);
+
+    if (pct >= 0) {
+        int fillW = (barW - 4) * pct / 100;
+        if (fillW > 0) c.fillRect(barX + 2, barY + 2, fillW, barH - 4, CLR_TEXT);
+        c.setFont(&fonts::Font2);
+        char pctStr[8]; snprintf(pctStr, sizeof(pctStr), "%d%%", pct);
+        int pw = c.textWidth(pctStr);
+        c.drawString(pctStr, (SCREEN_W - pw) / 2, barY + barH + 8);
+    } else {
+        // Indeterminate: three evenly-spaced dashes signal "working" without
+        // claiming a fake percentage for a request that has no progress to report.
+        int segW = (barW - 8) / 3;
+        for (int i = 0; i < 3; i++) {
+            c.fillRect(barX + 3 + i * segW, barY + 3, segW - 4, barH - 6, CLR_TEXT_DIM);
+        }
+    }
+
+    c.setFont(&fonts::Font0);
+    c.setTextColor(CLR_TEXT_DIM);
+    const char* warn = (pct >= 0) ? "Do not power off" : "";
+    if (warn[0]) {
+        int ww = c.textWidth(warn);
+        c.drawString(warn, (SCREEN_W - ww) / 2, SCREEN_H - 16);
+    }
 }
 
 // ── Completion animation ────────────────────────────────────────────────────
