@@ -33,6 +33,16 @@ public:
         return true;
     }
 
+    // Tears down the persistent TLS session. _sslClient's mbedTLS context
+    // stays allocated (~40-50KB) across calls for connection reuse — must be
+    // freed before any other concurrent WiFiClientSecure use (e.g. OTA),
+    // otherwise both fight over contiguous heap and the second handshake's
+    // malloc can fail intermittently ("SSL - Memory allocation failed").
+    void stop() {
+        _sslClient.stop();
+        _initialized = false;
+    }
+
     // ── Read resource: tasks for a day ──────────────────────────────────────
     bool fetchTasks(const char* dateStr, TaskItem* tasks, uint8_t& count, uint8_t maxCount) {
         char uri[64];
